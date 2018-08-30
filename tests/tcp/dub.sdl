@@ -1,5 +1,5 @@
 name "tests"
 description "TCP semantics tests"
 copyright "Copyright © 2015, rejectedsoftware e.K."
-dependency "vibe-d:stream" path="../../"
-//subConfiguration "vibe-d:core" "libasync"
+dependency "funkwerk-vibe-d:stream" path="../../"
+//subConfiguration "funkwerk-vibe-d:core" "libasync"

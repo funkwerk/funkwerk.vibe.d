@@ -1,2 +1,2 @@
 name "1922"
-dependency "vibe-d" path="../../"
+dependency "funkwerk-vibe-d" path="../../"

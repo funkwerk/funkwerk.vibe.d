@@ -1,7 +1,7 @@
 name "tls"
 description "TLS stream implementations"
 
-dependency "vibe-d:stream" version="*"
+dependency "funkwerk-vibe-d:stream" version="*"
 
 lflags "-L/usr/local/opt/openssl/lib" platform="osx"
 

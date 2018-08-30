@@ -1,5 +1,5 @@
-name "vibe-d"
-description "Event driven web and concurrency framework"
+name "funkwerk-vibe-d"
+description "Event driven web and concurrency framework, Funkwerk fork"
 homepage "http://vibed.org/"
 
 license "MIT"
@@ -23,7 +23,7 @@ dependency ":textfilter" version="*"
 dependency ":inet" version="*"
 
 targetType "library"
-targetName "vibed"
+targetName "funkwerk-vibed"
 
 // NOTE: "lib" is a path with no D sources to work around an issue in DUB 1.0.0
 //       and below that results in the standard "source/" path to be added even
@@ -37,19 +37,19 @@ x:ddoxFilterArgs "--unittest-examples" "--min-protection=Protected"\
 	"--ex" "mir."
 
 configuration "vibe-core" {
-	subConfiguration "vibe-d:core" "vibe-core"
+	subConfiguration "funkwerk-vibe-d:core" "vibe-core"
 }
 configuration "win32_mscoff" {
-	subConfiguration "vibe-d:core" "win32_mscoff"
+	subConfiguration "funkwerk-vibe-d:core" "win32_mscoff"
 }
 configuration "libevent" {
-	subConfiguration "vibe-d:core" "libevent"
+	subConfiguration "funkwerk-vibe-d:core" "libevent"
 }
 configuration "libasync" {
-	subConfiguration "vibe-d:core" "libasync"
+	subConfiguration "funkwerk-vibe-d:core" "libasync"
 }
 configuration "win32" {
-	subConfiguration "vibe-d:core" "win32"
+	subConfiguration "funkwerk-vibe-d:core" "win32"
 }
 
 subPackage "utils"
