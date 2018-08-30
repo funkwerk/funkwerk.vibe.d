@@ -97,7 +97,6 @@ import std.uuid;
 	a JSONException. Additionally, an explicit cast or using get!() or to!() is
 	required to convert a JSON value to the corresponding static D type.
 */
-align(8) // ensures that pointers stay on 64-bit boundaries on x64 so that they get scanned by the GC
 struct Json {
 @safe:
 
@@ -105,31 +104,18 @@ struct Json {
 		"struct Json is missing required ~this and/or this(this) members for BigInt.");
 
 	private {
-		// putting all fields in a union results in many false pointers leading to
-		// memory leaks and, worse, std.algorithm.swap triggering an assertion
-		// because of internal pointers. This crude workaround seems to fix
-		// the issues.
-		enum m_size = max((BigInt.sizeof+(void*).sizeof), 2);
-		// NOTE : DMD 2.067.1 doesn't seem to init void[] correctly on its own.
-		// Explicity initializing it works around this issue. Using a void[]
-		// array here to guarantee that it's scanned by the GC.
-		void[m_size] m_data = (void[m_size]).init;
+		enum size_t fillerSize = Largest!(BigInt, long, double, bool, string, Json[string], Json[]).sizeof;
 
-		static assert(m_data.offsetof == 0, "m_data must be the first struct member.");
-		static assert(BigInt.alignof <= 8, "Json struct alignment of 8 isn't sufficient to store BigInt.");
-
-		ref inout(T) getDataAs(T)() inout @trusted {
-			static assert(T.sizeof <= m_data.sizeof);
-			return (cast(inout(T)[1])m_data[0 .. T.sizeof])[0];
+		union {
+			ubyte[fillerSize] m_filler;
+			BigInt m_bigInt;
+			long m_int;
+			double m_float;
+			bool m_bool;
+			string m_string;
+			Json[string] m_object;
+			Json[] m_array;
 		}
-
-		@property ref inout(BigInt) m_bigInt() inout { return getDataAs!BigInt(); }
-		@property ref inout(long) m_int() inout { return getDataAs!long(); }
-		@property ref inout(double) m_float() inout { return getDataAs!double(); }
-		@property ref inout(bool) m_bool() inout { return getDataAs!bool(); }
-		@property ref inout(string) m_string() inout { return getDataAs!string(); }
-		@property ref inout(Json[string]) m_object() inout { return getDataAs!(Json[string])(); }
-		@property ref inout(Json[]) m_array() inout { return getDataAs!(Json[])(); }
 
 		Type m_type = Type.undefined;
 
@@ -175,9 +161,9 @@ struct Json {
 	/**
 		Constructor for a JSON object.
 	*/
-	this(typeof(null)) @trusted { m_type = Type.null_; }
+	this(typeof(null)) @trusted { zeroFields; m_type = Type.null_; }
 	/// ditto
-	this(bool v) @trusted { m_type = Type.bool_; m_bool = v; }
+	this(bool v) @trusted { zeroFields; m_type = Type.bool_; m_bool = v; }
 	/// ditto
 	this(byte v) { this(cast(long)v); }
 	/// ditto
@@ -191,20 +177,22 @@ struct Json {
 	/// ditto
 	this(uint v) { this(cast(long)v); }
 	/// ditto
-	this(long v) @trusted { m_type = Type.int_; m_int = v; }
+	this(long v) @trusted { zeroFields; m_type = Type.int_; m_int = v; }
 	/// ditto
-	this(BigInt v) @trusted { m_type = Type.bigInt; initBigInt(); m_bigInt = v; }
+	this(BigInt v) @trusted { zeroFields; m_type = Type.bigInt; initBigInt; m_bigInt = v; }
 	/// ditto
-	this(double v) @trusted { m_type = Type.float_; m_float = v; }
+	this(double v) @trusted { zeroFields; m_type = Type.float_; m_float = v; }
 	/// ditto
-	this(string v) @trusted { m_type = Type.string; m_string = v; }
+	this(string v) @trusted { zeroFields; m_type = Type.string; m_string = v; }
 	/// ditto
-	this(Json[] v) @trusted { m_type = Type.array; m_array = v; }
+	this(Json[] v) @trusted { zeroFields; m_type = Type.array; m_array = v; }
 	/// ditto
-	this(Json[string] v) @trusted { m_type = Type.object; m_object = v; }
+	this(Json[string] v) @trusted { zeroFields; m_type = Type.object; m_object = v; }
 
 	// used internally for UUID serialization support
 	private this(UUID v) { this(v.toString()); }
+
+	private void zeroFields() { m_filler = 0; }
 
 	/**
 		Converts a std.json.JSONValue object to a vibe Json object.
@@ -236,7 +224,7 @@ struct Json {
 	/**
 		Allows assignment of D values to a JSON value.
 	*/
-	ref Json opAssign(Json v)
+	ref Json opAssign(Json v) @trusted
 	{
 		if (v.type != Type.bigInt)
 			runDestructors();
@@ -260,7 +248,7 @@ struct Json {
 		return this;
 	}
 	/// ditto
-	void opAssign(typeof(null)) { runDestructors(); m_type = Type.null_; m_string = null; }
+	void opAssign(typeof(null)) @trusted { runDestructors(); m_type = Type.null_; m_string = null; }
 	/// ditto
 	bool opAssign(bool v) { runDestructors(); m_type = Type.bool_; m_bool = v; return v; }
 	/// ditto
@@ -268,7 +256,7 @@ struct Json {
 	/// ditto
 	long opAssign(long v) { runDestructors(); m_type = Type.int_; m_int = v; return v; }
 	/// ditto
-	BigInt opAssign(BigInt v)
+	BigInt opAssign(BigInt v) @trusted
 	{
 		if (m_type != Type.bigInt)
 			initBigInt();
@@ -279,9 +267,10 @@ struct Json {
 	/// ditto
 	double opAssign(double v) { runDestructors(); m_type = Type.float_; m_float = v; return v; }
 	/// ditto
-	string opAssign(string v) { runDestructors(); m_type = Type.string; m_string = v; return v; }
+	string opAssign(string v) @trusted { runDestructors(); m_type = Type.string; m_string = v; return v; }
 	/// ditto
-	Json[] opAssign(Json[] v) {
+	Json[] opAssign(Json[] v) @trusted
+	{
 		runDestructors();
 		m_type = Type.array;
 		m_array = v;
@@ -292,7 +281,7 @@ struct Json {
 		return v;
 	}
 	/// ditto
-	Json[string] opAssign(Json[string] v)
+	Json[string] opAssign(Json[string] v) @trusted
 	{
 		runDestructors();
 		m_type = Type.object;
@@ -302,12 +291,12 @@ struct Json {
 	}
 
 	// used internally for UUID serialization support
-	private UUID opAssign(UUID v) { opAssign(v.toString()); return v; }
+	private UUID opAssign(UUID v) @safe { opAssign(v.toString()); return v; }
 
 	/**
 		Allows removal of values from Type.Object Json objects.
 	*/
-	void remove(string item) { checkType!(Json[string])(); m_object.remove(item); }
+	void remove(string item) @trusted { checkType!(Json[string])(); m_object.remove(item); }
 
 	/**
 		The current type id of this JSON object.
@@ -318,7 +307,7 @@ struct Json {
 		Clones a JSON value recursively.
 	*/
 	Json clone()
-	const {
+	const @trusted {
 		final switch (m_type) {
 			case Type.undefined: return Json.undefined;
 			case Type.null_: return Json(null);
@@ -341,7 +330,7 @@ struct Json {
 	/**
 		Allows direct indexing of array typed JSON values.
 	*/
-	ref inout(Json) opIndex(size_t idx) inout { checkType!(Json[])(); return m_array[idx]; }
+	ref inout(Json) opIndex(size_t idx) inout @trusted { checkType!(Json[])(); return m_array[idx]; }
 
 	///
 	unittest {
@@ -362,7 +351,7 @@ struct Json {
 		Returns an object of `Type.undefined` if the key was not found.
 	*/
 	const(Json) opIndex(string key)
-	const {
+	const @trusted {
 		checkType!(Json[string])();
 		if( auto pv = key in m_object ) return *pv;
 		Json ret = Json.undefined;
@@ -371,7 +360,7 @@ struct Json {
 		return ret;
 	}
 	/// ditto
-	ref Json opIndex(string key)
+	ref Json opIndex(string key) @trusted
 	{
 		checkType!(Json[string])();
 		if( auto pv = key in m_object )
@@ -406,9 +395,17 @@ struct Json {
 	/**
 		Returns a slice of a JSON array.
 	*/
-	inout(Json[]) opSlice() inout { checkType!(Json[])(); return m_array; }
+	inout(Json[]) opSlice() inout @trusted
+	{
+		checkType!(Json[])();
+		return m_array;
+	}
 	///
-	inout(Json[]) opSlice(size_t from, size_t to) inout { checkType!(Json[])(); return m_array[from .. to]; }
+	inout(Json[]) opSlice(size_t from, size_t to) inout @trusted
+	{
+		checkType!(Json[])();
+		return m_array[from .. to];
+	}
 
 	/**
 		Returns the number of entries of string, array or object typed JSON values.
@@ -506,9 +503,9 @@ struct Json {
 	/// ditto
 	@property auto byKeyValue() const @trusted { checkType!(Json[string])("byKeyValue"); return m_object.byKeyValue.map!(kv => const(KeyValue)(kv.key, kv.value)).trustedRange; }
 	/// Iterates over all index/value pairs of an array.
-	@property auto byIndexValue() { checkType!(Json[])("byIndexValue"); return zip(iota(0, m_array.length), m_array); }
+	@property auto byIndexValue() @trusted { checkType!(Json[])("byIndexValue"); return zip(iota(0, m_array.length), m_array); }
 	/// ditto
-	@property auto byIndexValue() const { checkType!(Json[])("byIndexValue"); return zip(iota(0, m_array.length), m_array); }
+	@property auto byIndexValue() const @trusted { checkType!(Json[])("byIndexValue"); return zip(iota(0, m_array.length), m_array); }
 	/// Iterates over all values of an object or array.
 	@property auto byValue() @trusted {
 		checkType!(Json[], Json[string])("byValue");
@@ -664,7 +661,7 @@ struct Json {
 		See_Also: `get`, `deserializeJson`
 	*/
 	@property inout(T) to(T)()
-	inout {
+	inout @trusted {
 		static if( is(T == bool) ){
 			final switch( m_type ){
 				case Type.undefined: return false;
@@ -773,7 +770,7 @@ struct Json {
 		)
 	*/
 	Json opUnary(string op)()
-	const {
+	const @trusted {
 		static if( op == "~" ){
 			checkType!bool();
 			return Json(~m_bool);
@@ -803,7 +800,7 @@ struct Json {
 		)
 	*/
 	Json opBinary(string op)(ref const(Json) other)
-	const {
+	const @trusted {
 		enforceJson(m_type == other.m_type, "Binary operation '"~op~"' between "~.to!string(m_type)~" and "~.to!string(other.m_type)~" JSON objects.");
 		static if( op == "&&" ){
 			checkType!(bool)(op);
@@ -849,7 +846,7 @@ struct Json {
 		} else static assert(0, "Unsupported operator '"~op~"' for type JSON.");
 	}
 	/// ditto
-	Json opBinary(string op)(Json other)
+	Json opBinary(string op)(Json other) @trusted
 		if( op == "~" )
 	{
 		static if( op == "~" ){
@@ -860,7 +857,7 @@ struct Json {
 		} else static assert(0, "Unsupported operator '"~op~"' for type JSON.");
 	}
 	/// ditto
-	void opOpAssign(string op)(Json other)
+	void opOpAssign(string op)(Json other) @trusted
 		if (op == "+" || op == "-" || op == "*" || op == "/" || op == "%" || op =="~")
 	{
 		enforceJson(m_type == other.m_type || op == "~" && m_type == Type.array,
@@ -907,7 +904,7 @@ struct Json {
 	/// ditto
 	Json opBinary(string op)(bool other) const { checkType!bool(); mixin("return Json(m_bool "~op~" other);"); }
 	/// ditto
-	Json opBinary(string op)(long other) const
+	Json opBinary(string op)(long other) const @trusted
 	{
 		checkType!(long, BigInt)();
 		if (m_type == Type.bigInt)
@@ -916,7 +913,7 @@ struct Json {
 			mixin("return Json(m_int "~op~" other);");
 	}
 	/// ditto
-	Json opBinary(string op)(BigInt other) const
+	Json opBinary(string op)(BigInt other) const @trusted
 	{
 		checkType!(long, BigInt)();
 		if (m_type == Type.bigInt)
@@ -927,13 +924,13 @@ struct Json {
 	/// ditto
 	Json opBinary(string op)(double other) const { checkType!double(); mixin("return Json(m_float "~op~" other);"); }
 	/// ditto
-	Json opBinary(string op)(string other) const { checkType!string(); mixin("return Json(m_string "~op~" other);"); }
+	Json opBinary(string op)(string other) const @trusted { checkType!string(); mixin("return Json(m_string "~op~" other);"); }
 	/// ditto
-	Json opBinary(string op)(Json[] other) { checkType!(Json[])(); mixin("return Json(m_array "~op~" other);"); }
+	Json opBinary(string op)(Json[] other) @trusted { checkType!(Json[])(); mixin("return Json(m_array "~op~" other);"); }
 	/// ditto
 	Json opBinaryRight(string op)(bool other) const { checkType!bool(); mixin("return Json(other "~op~" m_bool);"); }
 	/// ditto
-	Json opBinaryRight(string op)(long other) const
+	Json opBinaryRight(string op)(long other) const @trusted
 	{
 		checkType!(long, BigInt)();
 		if (m_type == Type.bigInt)
@@ -942,7 +939,7 @@ struct Json {
 			mixin("return Json(other "~op~" m_int);");
 	}
 	/// ditto
-	Json opBinaryRight(string op)(BigInt other) const
+	Json opBinaryRight(string op)(BigInt other) const @trusted
 	{
 		checkType!(long, BigInt)();
 		if (m_type == Type.bigInt)
@@ -953,9 +950,13 @@ struct Json {
 	/// ditto
 	Json opBinaryRight(string op)(double other) const { checkType!double(); mixin("return Json(other "~op~" m_float);"); }
 	/// ditto
-	Json opBinaryRight(string op)(string other) const if(op == "~") { checkType!string(); return Json(other ~ m_string); }
+	Json opBinaryRight(string op)(string other) const @trusted if(op == "~")
+	{
+		checkType!string();
+		return Json(other ~ m_string);
+	}
 	/// ditto
-	Json opBinaryRight(string op)(Json[] other) { checkType!(Json[])(); mixin("return Json(other "~op~" m_array);"); }
+	Json opBinaryRight(string op)(Json[] other) @trusted { checkType!(Json[])(); mixin("return Json(other "~op~" m_array);"); }
 
 
 	/** Checks wheter a particular key is set and returns a pointer to it.
@@ -963,7 +964,7 @@ struct Json {
 		For field that don't exist or have a type of `Type.undefined`,
 		the `in` operator will return `null`.
 	*/
-	inout(Json)* opBinaryRight(string op)(string other) inout
+	inout(Json)* opBinaryRight(string op)(string other) inout @trusted
 		if(op == "in")
 	{
 		checkType!(Json[string])();
@@ -989,7 +990,7 @@ struct Json {
 	/**
 	 * The append operator will append arrays. This method always appends it's argument as an array element, so nested arrays can be created.
 	 */
-	void appendArrayElement(Json element)
+	void appendArrayElement(Json element) @trusted
 	{
 		enforceJson(m_type == Type.array, "'appendArrayElement' only allowed for array types, not "~.to!string(m_type)~".");
 		m_array ~= element;
@@ -1004,7 +1005,7 @@ struct Json {
 	*/
 
 	bool opEquals(ref const Json other)
-	const {
+	const @trusted {
 		if( m_type != other.m_type ) return false;
 		final switch(m_type){
 			case Type.undefined: return false;
@@ -1025,15 +1026,15 @@ struct Json {
 	/// ditto
 	bool opEquals(bool v) const { return m_type == Type.bool_ && m_bool == v; }
 	/// ditto
-	bool opEquals(int v) const { return (m_type == Type.int_ && m_int == v) || (m_type == Type.bigInt && m_bigInt == v); }
+	bool opEquals(int v) const @trusted { return (m_type == Type.int_ && m_int == v) || (m_type == Type.bigInt && m_bigInt == v); }
 	/// ditto
-	bool opEquals(long v) const { return (m_type == Type.int_ && m_int == v) || (m_type == Type.bigInt && m_bigInt == v); }
+	bool opEquals(long v) const @trusted { return (m_type == Type.int_ && m_int == v) || (m_type == Type.bigInt && m_bigInt == v); }
 	/// ditto
-	bool opEquals(BigInt v) const { return (m_type == Type.int_ && m_int == v) || (m_type == Type.bigInt && m_bigInt == v); }
+	bool opEquals(BigInt v) const @trusted { return (m_type == Type.int_ && m_int == v) || (m_type == Type.bigInt && m_bigInt == v); }
 	/// ditto
 	bool opEquals(double v) const { return m_type == Type.float_ && m_float == v; }
 	/// ditto
-	bool opEquals(string v) const { return m_type == Type.string && m_string == v; }
+	bool opEquals(string v) const @trusted { return m_type == Type.string && m_string == v; }
 
 	/**
 		Compares two JSON values.
@@ -1046,7 +1047,7 @@ struct Json {
 		exception.
 	*/
 	int opCmp(ref const Json other)
-	const {
+	const @trusted {
 		if( m_type != other.m_type ) return m_type < other.m_type ? -1 : 1;
 		final switch(m_type){
 			case Type.undefined: return 0;
@@ -1177,18 +1178,19 @@ struct Json {
 		else throw new JSONException(format("Got %s, expected %s for %s.", name, expected, op));
 	}
 
-	private void initBigInt()
-	@trusted {
-		BigInt[1] init_;
+	private void initBigInt() @trusted
+	{
 		// BigInt is a struct, and it has a special BigInt.init value, which differs from null.
-		// m_data has no special initializer and when it tries to first access to BigInt
-		// via m_bigInt(), we should explicitly initialize m_data with BigInt.init
-		m_data[0 .. BigInt.sizeof] = cast(void[])init_;
+		m_bigInt = BigInt.init;
 	}
 
-	private void runDestructors()
+	private void runDestructors() @trusted
 	{
-		if (m_type != Type.bigInt) return;
+		if (m_type != Type.bigInt)
+		{
+			zeroFields;
+			return;
+		}
 
 		BigInt init_;
 		// After swaping, init_ contains the real number from Json, and it
@@ -1198,7 +1200,7 @@ struct Json {
 		swap(init_, m_bigInt);
 	}
 
-	private long bigIntToLong() inout
+	private long bigIntToLong() inout @trusted
 	{
 		assert(m_type == Type.bigInt, format("Converting non-bigInt type with bitIntToLong!?: %s", cast(Type)m_type));
 		enforceJson(m_bigInt >= long.min && m_bigInt <= long.max, "Number out of range while converting BigInt("~format("%d", m_bigInt)~") to long.");
@@ -1350,6 +1352,7 @@ Json parseJsonString(string str, string filename = null)
 	assert(parseJsonString("99999999999999999999999999") == () @trusted { return Json(BigInt("99999999999999999999999999")); } ());
 	auto json = parseJsonString(`{"hey": "This is @à test éhééhhéhéé !%/??*&?\ud83d\udcec"}`);
 	assert(json.toPrettyString() == parseJsonString(json.toPrettyString()).toPrettyString());
+	assert(parseJsonString("{\"a\": 1}") == Json(["a": Json(1)]));
 
 	bool test() {
 		assert(parseJsonString("null") == Json(null));
@@ -1359,7 +1362,6 @@ Json parseJsonString(string str, string filename = null)
 		assert(parseJsonString("2.0") == Json(2.0));
 		assert(parseJsonString("\"test\"") == Json("test"));
 		assert(parseJsonString("[1, 2, 3]") == Json([Json(1), Json(2), Json(3)]));
-		assert(parseJsonString("{\"a\": 1}") == Json(["a": Json(1)]));
 		assert(parseJsonString(`"\\\/\b\f\n\r\t\u1234"`).get!string == "\\/\b\f\n\r\t\u1234");
 
 		return true;
