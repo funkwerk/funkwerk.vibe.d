@@ -1,7 +1,7 @@
 /**
 	A HTTP 1.1/1.0 server implementation.
 
-	Copyright: © 2012-2017 RejectedSoftware e.K.
+	Copyright: © 2012-2017 Sönke Ludwig
 	License: Subject to the terms of the MIT license, as written in the included LICENSE.txt file.
 	Authors: Sönke Ludwig, Jan Krüger, Ilya Shipunov
 */
@@ -189,7 +189,7 @@ unittest
 	the function returns to the caller.
 
 	Params:
-		connections = The stream to treat as an incoming HTTP client connection.
+		connection = The stream to treat as an incoming HTTP client connection.
 		context = Information about the incoming listener and available
 			virtual hosts
 */
@@ -199,6 +199,12 @@ void handleHTTPConnection(TCPConnection connection, HTTPServerContext context)
 	http_stream = connection;
 
 	scope (exit) connection.close();
+
+	// check wether the client's address is banned
+	foreach (ref virtual_host; context.m_virtualHosts)
+		if ((virtual_host.settings.isBannedDg !is null) &&
+			virtual_host.settings.isBannedDg(connection.remoteAddress()))
+			return;
 
 	// Set NODELAY to true, to avoid delays caused by sending the response
 	// header and body in separate chunks. Note that to avoid other performance
@@ -230,6 +236,11 @@ void handleHTTPConnection(TCPConnection connection, HTTPServerContext context)
 	while (!connection.empty) {
 		HTTPServerSettings settings;
 		bool keep_alive;
+
+		version(HaveNoTLS) {} else {
+			// handle oderly TLS shutdowns
+			if (tls_stream && tls_stream.empty) break;
+		}
 
 		() @trusted {
 			import vibe.internal.utilallocator: RegionListAllocator;
@@ -360,7 +371,7 @@ struct DefaultDietFilters {
 		string indent_string = "\n";
 		while (indent-- > 0) indent_string ~= '\t';
 
-		string ret = indent_string~"<style type=\"text/css\"><!--";
+		string ret = indent_string~"<style><!--";
 		indent_string = indent_string ~ '\t';
 		foreach (ln; lines) ret ~= indent_string ~ ln;
 		indent_string = indent_string[0 .. $-1];
@@ -377,7 +388,7 @@ struct DefaultDietFilters {
 		string indent_string = "\n";
 		while (indent-- > 0) indent_string ~= '\t';
 
-		string ret = indent_string~"<script type=\"application/javascript\">";
+		string ret = indent_string~"<script>";
 		ret ~= indent_string~'\t' ~ "//<![CDATA[";
 		foreach (ln; lines) ret ~= indent_string ~ '\t' ~ ln;
 		ret ~= indent_string ~ '\t' ~ "//]]>" ~ indent_string ~ "</script>";
@@ -421,15 +432,15 @@ unittest {
 		return strip(cast(string)(dst.data));
 	}
 
-	assert(compile!":css .test" == "<style type=\"text/css\"><!--\n\t.test\n--></style>");
-	assert(compile!":javascript test();" == "<script type=\"application/javascript\">\n\t//<![CDATA[\n\ttest();\n\t//]]>\n</script>");
+	assert(compile!":css .test" == "<style><!--\n\t.test\n--></style>");
+	assert(compile!":javascript test();" == "<script>\n\t//<![CDATA[\n\ttest();\n\t//]]>\n</script>");
 	assert(compile!":markdown **test**" == "<p><strong>test</strong>\n</p>");
 	assert(compile!":htmlescape <test>" == "&lt;test&gt;");
-	assert(compile!":css !{\".test\"}" == "<style type=\"text/css\"><!--\n\t.test\n--></style>");
-	assert(compile!":javascript !{\"test();\"}" == "<script type=\"application/javascript\">\n\t//<![CDATA[\n\ttest();\n\t//]]>\n</script>");
+	assert(compile!":css !{\".test\"}" == "<style><!--\n\t.test\n--></style>");
+	assert(compile!":javascript !{\"test();\"}" == "<script>\n\t//<![CDATA[\n\ttest();\n\t//]]>\n</script>");
 	assert(compile!":markdown !{\"**test**\"}" == "<p><strong>test</strong>\n</p>");
 	assert(compile!":htmlescape !{\"<test>\"}" == "&lt;test&gt;");
-	assert(compile!":javascript\n\ttest();" == "<script type=\"application/javascript\">\n\t//<![CDATA[\n\ttest();\n\t//]]>\n</script>");
+	assert(compile!":javascript\n\ttest();" == "<script>\n\t//<![CDATA[\n\ttest();\n\t//]]>\n</script>");
 }
 
 
@@ -460,8 +471,18 @@ HTTPServerRequest createTestHTTPServerRequest(URL url, HTTPMethod method, InetHe
 
 /**
 	Creates a HTTPServerResponse suitable for writing unit tests.
+
+	Params:
+		data_sink = Optional output stream that captures the data that gets
+			written to the response
+		session_store = Optional session store to use when sessions are involved
+		data_mode = If set to `TestHTTPResponseMode.bodyOnly`, only the body
+			contents get written to `data_sink`. Otherwise the raw response
+			including the HTTP header is written.
 */
-HTTPServerResponse createTestHTTPServerResponse(OutputStream data_sink = null, SessionStore session_store = null)
+HTTPServerResponse createTestHTTPServerResponse(OutputStream data_sink = null,
+	SessionStore session_store = null,
+	TestHTTPResponseMode data_mode = TestHTTPResponseMode.plain)
 @safe {
 	import vibe.stream.wrapper;
 
@@ -470,9 +491,15 @@ HTTPServerResponse createTestHTTPServerResponse(OutputStream data_sink = null, S
 		settings = new HTTPServerSettings;
 		settings.sessionStore = session_store;
 	}
-	if (!data_sink) data_sink = new NullOutputStream;
-	auto stream = createProxyStream(Stream.init, data_sink);
-	auto ret = new HTTPServerResponse(stream, null, settings, () @trusted { return vibeThreadAllocator(); } ());
+
+	InterfaceProxy!Stream outstr;
+	if (data_sink && data_mode == TestHTTPResponseMode.plain)
+		outstr = createProxyStream(Stream.init, data_sink);
+	else outstr = createProxyStream(Stream.init, nullSink);
+
+	auto ret = new HTTPServerResponse(outstr, InterfaceProxy!ConnectionStream.init,
+		settings, () @trusted { return vibeThreadAllocator(); } ());
+	if (data_sink && data_mode == TestHTTPResponseMode.bodyOnly) ret.m_bodyWriter = data_sink;
 	return ret;
 }
 
@@ -522,11 +549,19 @@ final class HTTPServerErrorInfo {
 alias HTTPServerErrorPageHandler = void delegate(HTTPServerRequest req, HTTPServerResponse res, HTTPServerErrorInfo error) @safe;
 
 
+enum TestHTTPResponseMode {
+	plain,
+	bodyOnly
+}
+
+
 private enum HTTPServerOptionImpl {
 	none                      = 0,
 	errorStackTraces          = 1<<7,
 	reusePort                 = 1<<8,
-	distribute                = 1<<9 // deprecated
+	distribute                = 1<<9, // deprecated
+	reuseAddress              = 1<<10,
+	defaults                  = reuseAddress
 }
 
 // TODO: Should be turned back into an enum once the deprecated symbols can be removed
@@ -541,34 +576,6 @@ private enum HTTPServerOptionImpl {
 */
 struct HTTPServerOption {
 	static enum none                      = HTTPServerOptionImpl.none;
-	deprecated("This is done lazily. It will be removed in 0.9.")
-	static enum parseURL                  = none;
-	deprecated("This is done lazily. It will be removed in 0.9.")
-	static enum parseQueryString          = none;
-	deprecated("This is done lazily. It will be removed in 0.9.")
-	static enum parseFormBody             = none;
-	deprecated("This is done lazily. It will be removed in 0.9.")
-	static enum parseJsonBody             = none;
-	deprecated("This is done lazily. It will be removed in 0.9.")
-	static enum parseMultiPartBody        = none;
-	/** Deprecated: Distributes request processing among worker threads
-
-		Note that this functionality assumes that the request handler
-		is implemented in a thread-safe way. However, the D type system
-		is bypassed, so that no static verification takes place.
-
-		For this reason, it is recommended to instead use
-		`vibe.core.core.runWorkerTaskDist` and call `listenHTTP`
-		from each task/thread individually. If the `reusePort` option
-		is set, then all threads will be able to listen on the same port,
-		with the operating system distributing the incoming connections.
-
-		If possible, instead of threads, the use of separate processes
-		is more robust and often faster. The `reusePort` option works
-		the same way in this scenario.
-	*/
-	deprecated("Use runWorkerTaskDist or start threads separately. It will be removed in 0.9.")
-	static enum distribute                = HTTPServerOptionImpl.distribute;
 	/** Enables stack traces (`HTTPServerErrorInfo.debugMessage`).
 
 		Note that generating the stack traces are generally a costly
@@ -580,28 +587,22 @@ struct HTTPServerOption {
 	static enum errorStackTraces          = HTTPServerOptionImpl.errorStackTraces;
 	/// Enable port reuse in `listenTCP()`
 	static enum reusePort                 = HTTPServerOptionImpl.reusePort;
+	/// Enable address reuse in `listenTCP()`
+	static enum reuseAddress              = HTTPServerOptionImpl.reuseAddress;
 
 	/** The default set of options.
 
 		Includes all parsing options, as well as the `errorStackTraces`
 		option if the code is compiled in debug mode.
 	*/
-	static enum defaults = () { debug return HTTPServerOptionImpl.errorStackTraces; else return HTTPServerOptionImpl.none; } ().HTTPServerOption;
+	static enum defaults = () {
+		HTTPServerOptionImpl ops = HTTPServerOptionImpl.defaults;
+		debug ops |= HTTPServerOptionImpl.errorStackTraces;
+		return ops;
+	} ().HTTPServerOption;
 
 	deprecated("None has been renamed to none.")
 	static enum None = none;
-	deprecated("This is done lazily. It will be removed in 0.9.")
-	static enum ParseURL = none;
-	deprecated("This is done lazily. It will be removed in 0.9.")
-	static enum ParseQueryString = none;
-	deprecated("This is done lazily. It will be removed in 0.9.")
-	static enum ParseFormBody = none;
-	deprecated("This is done lazily. It will be removed in 0.9.")
-	static enum ParseJsonBody = none;
-	deprecated("This is done lazily. It will be removed in 0.9.")
-	static enum ParseMultiPartBody = none;
-	deprecated("This is done lazily. It will be removed in 0.9.")
-	static enum ParseCookies = none;
 
 	HTTPServerOptionImpl x;
 	alias x this;
@@ -637,6 +638,17 @@ final class HTTPServerSettings {
 		gets a request.
 	*/
 	string hostName;
+
+	/** Provides a way to ban and unban network addresses and reduce the
+		impact of DOS attack.
+
+		If the isBannedDg returns true for a specific NetworkAddress,
+		then all incoming requests from that address will be rejected.
+	*/
+	IsBannedDg isBannedDg;
+
+	/// Type of delegate accepted for `isBannedDg`
+	alias IsBannedDg = bool delegate (in NetworkAddress) @safe nothrow;
 
 	/** Configures optional features of the HTTP server
 
@@ -685,6 +697,9 @@ final class HTTPServerSettings {
 	/// Session management is enabled if a session store instance is provided
 	SessionStore sessionStore;
 	string sessionIdCookie = "vibe.session_id";
+
+	/// Session options to use when initializing a new session.
+	SessionOption sessionOptions = SessionOption.httpOnly;
 
 	///
 	import vibe.core.core : vibeVersionString;
@@ -832,7 +847,17 @@ enum SessionOption {
 
 		See_Also: secure, Cookie.secure
 	*/
-	noSecure = 1<<2
+	noSecure = 1<<2,
+
+	/**
+    Instructs the browser to allow sending this cookie along with cross-site requests.
+
+    By default, the protection is `strict`. This flag allows to set it to `lax`.
+    The strict value will prevent the cookie from being sent by the browser
+    to the target site in all cross-site browsing context,
+    even when following a regular link.
+	*/
+	noSameSiteStrict = 1<<3,
 }
 
 
@@ -920,7 +945,7 @@ final class HTTPServerRequest : HTTPRequest {
 			if (_cookies.isNull) {
 				_cookies = CookieValueMap.init;
 				if (auto pv = "cookie" in headers)
-					parseCookies(*pv, _cookies);
+					parseCookies(*pv, _cookies.get);
 			}
 			return _cookies.get;
 		}
@@ -933,7 +958,7 @@ final class HTTPServerRequest : HTTPRequest {
 		@property ref FormFields query() @safe {
 			if (_query.isNull) {
 				_query = FormFields.init;
-				parseURLEncodedForm(queryString, _query);
+				parseURLEncodedForm(queryString, _query.get);
 			}
 
 			return _query.get;
@@ -1012,8 +1037,7 @@ final class HTTPServerRequest : HTTPRequest {
 
 		private void parseFormAndFiles() @safe {
 			_form = FormFields.init;
-			assert(!!bodyReader);
-			parseFormData(_form, _files, headers.get("Content-Type", ""), bodyReader, MaxHTTPHeaderLineLength);
+			parseFormData(_form.get, _files, headers.get("Content-Type", ""), bodyReader, MaxHTTPHeaderLineLength);
 		}
 
 		/** Contains information about any uploaded file for a HTML _form request.
@@ -1173,6 +1197,7 @@ final class HTTPServerResponse : HTTPResponse {
 		bool m_headerWritten = false;
 		bool m_isHeadResponse = false;
 		bool m_tls;
+		bool m_requiresConnectionClose;
 		SysTime m_timeFinalized;
 	}
 
@@ -1215,7 +1240,7 @@ final class HTTPServerResponse : HTTPResponse {
 		Params:
 			data = The data to write as the body contents
 			status = Optional response status code to set
-			content_tyoe = Optional content type to apply to the response.
+			content_type = Optional content type to apply to the response.
 				If no content type is given and no "Content-Type" header is
 				set in the response, this will default to
 				`"application/octet-stream"`.
@@ -1406,6 +1431,7 @@ final class HTTPServerResponse : HTTPResponse {
 		if (m_bodyWriter) return m_bodyWriter;
 
 		assert(!m_headerWritten, "A void body was already written!");
+		assert(this.statusCode >= 200, "1xx responses can't have body");
 
 		if (m_isHeadResponse) {
 			// for HEAD requests, we define a NullOutputWriter for convenience
@@ -1511,6 +1537,8 @@ final class HTTPServerResponse : HTTPResponse {
 		statusCode = HTTPStatus.SwitchingProtocols;
 		if (protocol.length) headers["Upgrade"] = protocol;
 		writeVoidBody();
+		m_requiresConnectionClose = true;
+		m_headerWritten = true;
 		return createConnectionProxyStream(m_conn, m_rawConnection);
 	}
 	/// ditto
@@ -1519,13 +1547,13 @@ final class HTTPServerResponse : HTTPResponse {
 		statusCode = HTTPStatus.SwitchingProtocols;
 		if (protocol.length) headers["Upgrade"] = protocol;
 		writeVoidBody();
+		m_requiresConnectionClose = true;
+		m_headerWritten = true;
 		() @trusted {
 			auto conn = createConnectionProxyStreamFL(m_conn, m_rawConnection);
 			del(conn);
 		} ();
 		finalize();
-		if (m_rawConnection && m_rawConnection.connected)
-			m_rawConnection.close(); // connection not reusable after a protocol upgrade
 	}
 
 	/** Special method for handling CONNECT proxy tunnel
@@ -1546,7 +1574,6 @@ final class HTTPServerResponse : HTTPResponse {
 			del(conn);
 		} ();
 		finalize();
-		m_rawConnection.close(); // connection not reusable after a protocol upgrade
 	}
 
 	/** Sets the specified cookie value.
@@ -1555,6 +1582,7 @@ final class HTTPServerResponse : HTTPResponse {
 			name = Name of the cookie
 			value = New cookie value - pass null to clear the cookie
 			path = Path (as seen by the client) of the directory tree in which the cookie is visible
+			encoding = Optional encoding (url, raw), default to URL encoding
 	*/
 	Cookie setCookie(string name, string value, string path = "/", Cookie.Encoding encoding = Cookie.Encoding.url)
 	@safe {
@@ -1576,7 +1604,13 @@ final class HTTPServerResponse : HTTPResponse {
 		creating the server. Depending on this, the session can be persistent
 		or temporary and specific to this server instance.
 	*/
-	Session startSession(string path = "/", SessionOption options = SessionOption.httpOnly)
+	Session startSession(string path = "/")
+	@safe {
+		return startSession(path, m_settings.sessionOptions);
+	}
+
+	/// ditto
+	Session startSession(string path, SessionOption options)
 	@safe {
 		assert(m_settings.sessionStore, "no session store set");
 		assert(!m_session, "Try to start a session, but already started one.");
@@ -1592,6 +1626,8 @@ final class HTTPServerResponse : HTTPResponse {
 		auto cookie = setCookie(m_settings.sessionIdCookie, m_session.id, path);
 		cookie.secure = secure;
 		cookie.httpOnly = (options & SessionOption.httpOnly) != 0;
+		cookie.sameSite = (options & SessionOption.noSameSiteStrict) ?
+						  Cookie.SameSite.lax : Cookie.SameSite.strict;
 		return m_session;
 	}
 
@@ -1666,8 +1702,9 @@ final class HTTPServerResponse : HTTPResponse {
 			catch (Exception e) logDebug("Failed to flush connection after finishing HTTP response: %s", e.msg);
 			if (!isHeadResponse && bytesWritten < headers.get("Content-Length", "0").to!long) {
 				logDebug("HTTP response only written partially before finalization. Terminating connection.");
-				m_rawConnection.close();
+				m_requiresConnectionClose = true;
 			}
+
 			m_rawConnection = InterfaceProxy!ConnectionStream.init;
 		}
 
@@ -1682,7 +1719,10 @@ final class HTTPServerResponse : HTTPResponse {
 		import vibe.stream.wrapper;
 
 		assert(!m_bodyWriter && !m_headerWritten, "Try to write header after body has already begun.");
-		m_headerWritten = true;
+		assert(this.httpVersion != HTTPVersion.HTTP_1_0 || this.statusCode >= 200, "Informational status codes aren't supported by HTTP/1.0.");
+
+		// Don't set m_headerWritten for 1xx status codes
+		if (this.statusCode >= 200) m_headerWritten = true;
 		auto dst = streamOutputRange!1024(m_conn);
 
 		void writeLine(T...)(string fmt, T args)
@@ -1703,7 +1743,7 @@ final class HTTPServerResponse : HTTPResponse {
 			this.statusPhrase.length ? this.statusPhrase : httpStatusText(this.statusCode));
 
 		// write all normal headers
-		foreach (k, v; this.headers) {
+		foreach (k, v; this.headers.byKeyValue) {
 			dst.put(k);
 			dst.put(": ");
 			dst.put(v);
@@ -1714,7 +1754,7 @@ final class HTTPServerResponse : HTTPResponse {
 		logTrace("---------------------");
 
 		// write cookies
-		foreach (n, cookie; this.cookies) {
+		foreach (n, cookie; this.cookies.byKeyValue) {
 			dst.put("Set-Cookie: ");
 			cookie.writeString(() @trusted { return &dst; } (), n);
 			dst.put("\r\n");
@@ -1995,10 +2035,11 @@ private HTTPListener listenHTTPPlain(HTTPServerSettings settings, HTTPServerRequ
 	import vibe.core.core : runWorkerTaskDist;
 	import std.algorithm : canFind, find;
 
-	static TCPListener doListen(HTTPServerContext listen_info, bool dist, bool reusePort)
+	static TCPListener doListen(HTTPServerContext listen_info, bool dist, bool reusePort, bool reuseAddress, bool is_tls)
 	@safe {
 		try {
 			TCPListenOptions options = TCPListenOptions.defaults;
+			if(reuseAddress) options |= TCPListenOptions.reuseAddress; else options &= ~TCPListenOptions.reuseAddress;
 			if(reusePort) options |= TCPListenOptions.reusePort; else options &= ~TCPListenOptions.reusePort;
 			auto ret = listenTCP(listen_info.bindPort, (TCPConnection conn) nothrow @safe {
 					try handleHTTPConnection(conn, listen_info);
@@ -2014,7 +2055,7 @@ private HTTPListener listenHTTPPlain(HTTPServerSettings settings, HTTPServerRequ
 			if (listen_info.bindPort == 0)
 				listen_info.m_bindPort = ret.bindAddress.port;
 
-			auto proto = listen_info.tlsContext ? "https" : "http";
+			auto proto = is_tls ? "https" : "http";
 			auto urladdr = listen_info.bindAddress;
 			if (urladdr.canFind(':')) urladdr = "["~urladdr~"]";
 			logInfo("Listening for requests on %s://%s:%s/", proto, urladdr, listen_info.bindPort);
@@ -2036,7 +2077,11 @@ private HTTPListener listenHTTPPlain(HTTPServerSettings settings, HTTPServerRequ
 		if (!l.empty) linfo = l.front;
 		else {
 			auto li = new HTTPServerContext(addr, settings.port);
-			if (auto tcp_lst = doListen(li, (settings.options & HTTPServerOptionImpl.distribute) != 0, (settings.options & HTTPServerOption.reusePort) != 0)) // DMD BUG 2043
+			if (auto tcp_lst = doListen(li,
+					(settings.options & HTTPServerOptionImpl.distribute) != 0,
+					(settings.options & HTTPServerOption.reusePort) != 0,
+					(settings.options & HTTPServerOption.reuseAddress) != 0,
+					settings.tlsContext !is null)) // DMD BUG 2043
 			{
 				li.m_listener = tcp_lst;
 				s_listeners ~= li;
@@ -2102,9 +2147,6 @@ private bool handleRequest(InterfaceProxy!Stream http_stream, TCPConnection tcp_
 	void errorOut(int code, string msg, string debug_msg, Throwable ex)
 	@safe {
 		assert(!res.headerWritten);
-
-		// stack traces sometimes contain random bytes - make sure they are replaced
-		debug_msg = sanitizeUTF8(cast(const(ubyte)[])debug_msg);
 
 		res.statusCode = code;
 		if (settings && settings.errorPageHandler) {
@@ -2209,7 +2251,7 @@ private bool handleRequest(InterfaceProxy!Stream http_stream, TCPConnection tcp_
 			}
 		}
 
-        // eagerly parse the URL as its lightweight and defacto @nogc
+		// eagerly parse the URL as its lightweight and defacto @nogc
 		auto url = URL.parse(req.requestURI);
 		req.queryString = url.queryString;
 		req.username = url.username;
@@ -2232,7 +2274,9 @@ private bool handleRequest(InterfaceProxy!Stream http_stream, TCPConnection tcp_
 		if (settings.serverString.length)
 			res.headers["Server"] = settings.serverString;
 		res.headers["Date"] = formatRFC822DateAlloc(request_allocator, reqtime);
-		if (req.persistent) res.headers["Keep-Alive"] = formatAlloc(request_allocator, "timeout=%d", settings.keepAliveTimeout.total!"seconds"());
+		if (req.persistent)
+			res.headers["Keep-Alive"] = formatAlloc(
+				request_allocator, "timeout=%d", settings.keepAliveTimeout.total!"seconds"());
 
 		// finished parsing the request
 		parsed = true;
@@ -2254,21 +2298,25 @@ private bool handleRequest(InterfaceProxy!Stream http_stream, TCPConnection tcp_
 		}
 	} catch (HTTPStatusException err) {
 		if (!res.headerWritten) errorOut(err.status, err.msg, err.debugMessage, err);
-		else logDiagnostic("HTTPSterrorOutatusException while writing the response: %s", err.msg);
-		debug logDebug("Exception while handling request %s %s: %s", req.method, req.requestURI, () @trusted { return err.toString().sanitize; } ());
+		else logDiagnostic("HTTPStatusException while writing the response: %s", err.msg);
+		debug logDebug("Exception while handling request %s %s: %s", req.method,
+					   req.requestURI, () @trusted { return err.toString().sanitize; } ());
 		if (!parsed || res.headerWritten || justifiesConnectionClose(err.status))
 			keep_alive = false;
 	} catch (UncaughtException e) {
 		auto status = parsed ? HTTPStatus.internalServerError : HTTPStatus.badRequest;
 		string dbg_msg;
-		if (settings.options & HTTPServerOption.errorStackTraces) dbg_msg = () @trusted { return e.toString().sanitize; } ();
-		if (!res.headerWritten && tcp_connection.connected) errorOut(status, httpStatusText(status), dbg_msg, e);
+		if (settings.options & HTTPServerOption.errorStackTraces)
+			dbg_msg = () @trusted { return e.toString().sanitize; } ();
+		if (!res.headerWritten && tcp_connection.connected)
+			errorOut(status, httpStatusText(status), dbg_msg, e);
 		else logDiagnostic("Error while writing the response: %s", e.msg);
-		debug logDebug("Exception while handling request %s %s: %s", req.method, req.requestURI, () @trusted { return e.toString().sanitize(); } ());
+		debug logDebug("Exception while handling request %s %s: %s", req.method,
+					   req.requestURI, () @trusted { return e.toString().sanitize(); } ());
 		if (!parsed || res.headerWritten || !cast(Exception)e) keep_alive = false;
 	}
 
-	if (tcp_connection.connected) {
+	if (tcp_connection.connected && keep_alive) {
 		if (req.bodyReader && !req.bodyReader.empty) {
 			req.bodyReader.pipe(nullSink);
 			logTrace("dropped body");
@@ -2278,7 +2326,10 @@ private bool handleRequest(InterfaceProxy!Stream http_stream, TCPConnection tcp_
 	// finalize (e.g. for chunked encoding)
 	res.finalize();
 
-	foreach (k, v ; req._files) {
+	if (res.m_requiresConnectionClose)
+		keep_alive = false;
+
+	foreach (k, v ; req._files.byKeyValue) {
 		if (existsFile(v.tempPath)) {
 			removeFile(v.tempPath);
 			logDebug("Deleted upload tempfile %s", v.tempPath.toString());
@@ -2328,7 +2379,7 @@ private void parseRequestHeader(InputStream)(HTTPServerRequest req, InputStream 
 	//headers
 	parseRFC5322Header(stream, req.headers, MaxHTTPHeaderLineLength, alloc, false);
 
-	foreach (k, v; req.headers)
+	foreach (k, v; req.headers.byKeyValue)
 		logTrace("%s: %s", k, v);
 	logTrace("--------------------");
 }

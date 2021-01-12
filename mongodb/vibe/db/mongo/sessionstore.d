@@ -1,7 +1,7 @@
 /**
 	MongoDB based HTTP session store.
 
-	Copyright: © 2017 RejectedSoftware e.K.
+	Copyright: © 2017 Sönke Ludwig
 	License: Subject to the terms of the MIT license, as written in the included LICENSE.txt file.
 	Authors: Sönke Ludwig
 */
@@ -73,7 +73,10 @@ final class MongoSessionStore : SessionStore {
 	@property void expirationTime(Duration dur)
 	{
 		import std.typecons : tuple;
-		m_sessions.ensureIndex([tuple("time", 1)], IndexFlags.none, dur);
+		IndexModel[1] index;
+		index[0].add("time", 1);
+		index[0].options.expireAfter = dur;
+		m_sessions.createIndexes(index[]);
 		m_expirationTime = dur;
 	}
 

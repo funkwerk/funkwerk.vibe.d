@@ -1,7 +1,7 @@
 /**
 	Base64 encoding routines
 
-	Copyright: © 2012-2016 RejectedSoftware e.K.
+	Copyright: © 2012-2016 Sönke Ludwig
 	License: Subject to the terms of the MIT license, as written in the included LICENSE.txt file.
 	Authors: Jan Krüger, Sönke Ludwig
 */
@@ -90,7 +90,7 @@ final class Base64OutputStreamImpl(char C62, char C63, char CPAD = '=', OutputSt
 
 		const(ubyte)[] bytes = bytes_;
 
-		auto rng = StreamOutputRange(m_out);
+		auto rng = streamOutputRange(m_out);
 
 		size_t nwritten = 0;
 

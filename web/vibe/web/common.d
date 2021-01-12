@@ -1,7 +1,7 @@
 /**
 	Contains common functionality for the REST and WEB interface generators.
 
-	Copyright: © 2012-2017 RejectedSoftware e.K.
+	Copyright: © 2012-2017 Sönke Ludwig
 	License: Subject to the terms of the MIT license, as written in the included LICENSE.txt file.
 	Authors: Sönke Ludwig, Михаил Страшун
 */
@@ -10,10 +10,12 @@ module vibe.web.common;
 import vibe.http.common;
 import vibe.http.server : HTTPServerRequest;
 import vibe.data.json;
-import vibe.internal.meta.uda : onlyAsUda;
+import vibe.internal.meta.uda : onlyAsUda, UDATuple;
 
+import std.meta : AliasSeq;
 static import std.utf;
 static import std.string;
+import std.traits : getUDAs, ReturnType;
 import std.typecons : Nullable;
 
 
@@ -30,6 +32,39 @@ string adjustMethodStyle(string name, MethodStyle style)
 	}
 
 	import std.uni;
+
+	string separate(char separator, bool upper_case)
+	{
+		string ret;
+		size_t start = 0, i = 0;
+		while (i < name.length) {
+			// skip acronyms
+			while (i < name.length && (i+1 >= name.length || (name[i+1] >= 'A' && name[i+1] <= 'Z'))) {
+				std.utf.decode(name, i);
+			}
+
+			// skip the main (lowercase) part of a word
+			while (i < name.length && !(name[i] >= 'A' && name[i] <= 'Z')) {
+				std.utf.decode(name, i);
+			}
+
+			// add a single word
+			if( ret.length > 0 ) {
+				ret ~= separator;
+			}
+			ret ~= name[start .. i];
+
+			// quick skip the capital and remember the start of the next word
+			start = i;
+			if (i < name.length) {
+				std.utf.decode(name, i);
+			}
+		}
+		if (start < name.length) {
+			ret ~= separator ~ name[start .. $];
+		}
+		return upper_case ? std.string.toUpper(ret) : std.string.toLower(ret);
+	}
 
 	final switch(style) {
 		case MethodStyle.unaltered:
@@ -62,42 +97,14 @@ string adjustMethodStyle(string name, MethodStyle style)
 			return std.string.toLower(name);
 		case MethodStyle.upperCase:
 			return std.string.toUpper(name);
-		case MethodStyle.lowerUnderscored:
-		case MethodStyle.upperUnderscored:
-			string ret;
-			size_t start = 0, i = 0;
-			while (i < name.length) {
-				// skip acronyms
-				while (i < name.length && (i+1 >= name.length || (name[i+1] >= 'A' && name[i+1] <= 'Z'))) {
-					std.utf.decode(name, i);
-				}
-
-				// skip the main (lowercase) part of a word
-				while (i < name.length && !(name[i] >= 'A' && name[i] <= 'Z')) {
-					std.utf.decode(name, i);
-				}
-
-				// add a single word
-				if( ret.length > 0 ) {
-					ret ~= "_";
-				}
-				ret ~= name[start .. i];
-
-				// quick skip the capital and remember the start of the next word
-				start = i;
-				if (i < name.length) {
-					std.utf.decode(name, i);
-				}
-			}
-			if (start < name.length) {
-				ret ~= "_" ~ name[start .. $];
-			}
-			return style == MethodStyle.lowerUnderscored ?
-				std.string.toLower(ret) : std.string.toUpper(ret);
+		case MethodStyle.lowerUnderscored: return separate('_', false);
+		case MethodStyle.upperUnderscored: return separate('_', true);
+		case MethodStyle.lowerDashed: return separate('-', false);
+		case MethodStyle.upperDashed: return separate('-', true);
 	}
 }
 
-@safe unittest
+unittest
 {
 	assert(adjustMethodStyle("methodNameTest", MethodStyle.unaltered) == "methodNameTest");
 	assert(adjustMethodStyle("methodNameTest", MethodStyle.camelCase) == "methodNameTest");
@@ -113,6 +120,8 @@ string adjustMethodStyle(string name, MethodStyle style)
 	assert(adjustMethodStyle("MethodNameTest", MethodStyle.upperCase) == "METHODNAMETEST");
 	assert(adjustMethodStyle("MethodNameTest", MethodStyle.lowerUnderscored) == "method_name_test");
 	assert(adjustMethodStyle("MethodNameTest", MethodStyle.upperUnderscored) == "METHOD_NAME_TEST");
+	assert(adjustMethodStyle("MethodNameTest", MethodStyle.lowerDashed) == "method-name-test");
+	assert(adjustMethodStyle("MethodNameTest", MethodStyle.upperDashed) == "METHOD-NAME-TEST");
 	assert(adjustMethodStyle("Q", MethodStyle.lowerUnderscored) == "q");
 	assert(adjustMethodStyle("getHTML", MethodStyle.lowerUnderscored) == "get_html");
 	assert(adjustMethodStyle("getHTMLEntity", MethodStyle.lowerUnderscored) == "get_html_entity");
@@ -439,10 +448,18 @@ class RestException : HTTPStatusException {
 		Json m_jsonResult;
 	}
 
-	@safe:
+    ///
+	this (int status, string result, string file = __FILE__, int line = __LINE__,
+		Throwable next = null) @safe
+	{
+		Json jsonResult = Json.emptyObject;
+		jsonResult["message"] = result;
+		this(status, jsonResult, file, line);
+	}
 
 	///
-	this(int status, Json jsonResult, string file = __FILE__, int line = __LINE__, Throwable next = null)
+	this (int status, Json jsonResult, string file = __FILE__, int line = __LINE__,
+		Throwable next = null) @safe
 	{
 		if (jsonResult.type == Json.Type.Object && jsonResult["statusMessage"].type == Json.Type.String) {
 			super(status, jsonResult["statusMessage"].get!string, file, line, next);
@@ -454,8 +471,11 @@ class RestException : HTTPStatusException {
 		m_jsonResult = jsonResult;
 	}
 
-	/// The HTTP status code
-	@property const(Json) jsonResult() const { return m_jsonResult; }
+	/// The result text reported to the client
+	@property inout(Json) jsonResult () inout nothrow pure @safe @nogc
+	{
+		return m_jsonResult;
+	}
 }
 
 /// private
@@ -472,9 +492,186 @@ package struct MethodAttribute
 	alias data this;
 }
 
+
+/** UDA for using a custom serializer for the method return value.
+
+	Instead of using the default serializer (JSON), this allows to define
+	custom serializers. Multiple serializers can be specified and will be
+	matched against the `Accept` header of the HTTP request.
+
+	Params:
+		serialize = An alias to a generic function taking an output range as
+			its first argument and the value to be serialized as its second
+			argument. The result of the serialization is written byte-wise into
+			the output range.
+		deserialize = An alias to a generic function taking a forward range
+			as its first argument and a reference to the value that is to be
+			deserialized.
+		content_type = The MIME type of the serialized representation.
+*/
+alias resultSerializer(alias serialize, alias deserialize, string content_type)
+	= ResultSerializer!(serialize, deserialize, content_type);
+
+///
+unittest {
+	import std.bitmanip : bigEndianToNative, nativeToBigEndian;
+
+	interface MyRestInterface {
+		static struct Point {
+			int x, y;
+		}
+
+		static void serialize(R, T)(ref R output_range, const ref T value)
+		{
+			static assert(is(T == Point)); // only Point supported in this example
+			output_range.put(nativeToBigEndian(value.x));
+			output_range.put(nativeToBigEndian(value.y));
+		}
+
+		static T deserialize(T, R)(R input_range)
+		{
+			static assert(is(T == Point)); // only Point supported in this example
+			T ret;
+			ubyte[4] xbuf, ybuf;
+			input_range.takeExactly(4).copy(xbuf[]);
+			input_range.takeExactly(4).copy(ybuf[]);
+			ret.x = bigEndianToNative!int(xbuf);
+			ret.y = bigEndianToNative!int(ybuf);
+			return ret;
+		}
+
+		// serialize as binary data in network byte order
+		@resultSerializer!(serialize, deserialize, "application/binary")
+		Point getPoint();
+	}
+}
+
 /// private
-package struct PathAttribute
+struct ResultSerializer(alias ST, alias DT, string ContentType) {
+	enum contentType = ContentType;
+	alias serialize = ST;
+	alias deserialize = DT;
+}
+
+
+package void defaultSerialize (alias P, T, RT) (ref RT output_range, in ref T value)
 {
+	static struct R {
+		typeof(output_range) underlying;
+		void put(char ch) { underlying.put(ch); }
+		void put(const(char)[] ch) { underlying.put(cast(const(ubyte)[])ch); }
+	}
+	auto dst = R(output_range);
+	value.serializeWithPolicy!(JsonStringSerializer!R, P) (dst);
+}
+
+package T defaultDeserialize (alias P, T, R) (R input_range)
+{
+	return deserializeWithPolicy!(JsonStringSerializer!(typeof(std.string.assumeUTF(input_range))), P, T)
+		(std.string.assumeUTF(input_range));
+}
+
+package alias DefaultSerializerT = ResultSerializer!(
+	defaultSerialize, defaultDeserialize, "application/json");
+
+
+/// Convenience template to get all the ResultSerializers for a function
+package template ResultSerializersT(alias func) {
+	alias DefinedSerializers = getUDAs!(func, ResultSerializer);
+	static if (getUDAs!(func, ResultSerializer).length)
+		alias ResultSerializersT = DefinedSerializers;
+	else
+		alias ResultSerializersT = AliasSeq!(DefaultSerializerT);
+}
+
+///
+package template SerPolicyT (Iface)
+{
+	static if (getUDAs!(Iface, SerPolicy).length)
+	{
+		alias SerPolicyT = getUDAs!(Iface, SerPolicy)[0];
+	}
+	else
+	{
+		alias SerPolicyT = SerPolicy!DefaultPolicy;
+	}
+}
+
+///
+package struct SerPolicy (alias PolicyTemplatePar)
+{
+	alias PolicyTemplate = PolicyTemplatePar;
+}
+
+///
+public alias serializationPolicy (Args...) = SerPolicy!(Args);
+
+unittest
+{
+	import vibe.data.serialization : Base64ArrayPolicy;
+	import std.array : appender;
+	import std.conv : to;
+
+	struct X
+	{
+		string name = "test";
+		ubyte[] arr = [138, 245, 231, 234, 142, 132, 142];
+	}
+	X x;
+
+	// Interface using Base64 array serialization
+	@serializationPolicy!(Base64ArrayPolicy)
+	interface ITestBase64
+	{
+		@safe X getTest();
+	}
+
+	alias serPolicyFound = SerPolicyT!ITestBase64;
+	alias resultSerializerFound = ResultSerializersT!(ITestBase64.getTest)[0];
+
+	// serialization test with base64 encoding
+	auto output = appender!string();
+
+	resultSerializerFound.serialize!(serPolicyFound.PolicyTemplate)(output, x);
+	auto serialized = output.data;
+	assert(serialized == `{"name":"test","arr":"ivXn6o6Ejg=="}`,
+			"serialization is not correct, produced: " ~ serialized);
+
+	// deserialization test with base64 encoding
+	auto deserialized = serialized.deserializeWithPolicy!(JsonStringSerializer!string, serPolicyFound.PolicyTemplate, X)();
+	assert(deserialized.name == "test", "deserialization of `name` is not correct, produced: " ~ deserialized.name);
+	assert(deserialized.arr == [138, 245, 231, 234, 142, 132, 142],
+			"deserialization of `arr` is not correct, produced: " ~ to!string(deserialized.arr));
+
+	// Interface NOT using Base64 array serialization
+	interface ITestPlain
+	{
+		@safe X getTest();
+	}
+
+	alias plainSerPolicyFound = SerPolicyT!ITestPlain;
+	alias plainResultSerializerFound = ResultSerializersT!(ITestPlain.getTest)[0];
+
+	// serialization test without base64 encoding
+	output = appender!string();
+	plainResultSerializerFound.serialize!(plainSerPolicyFound.PolicyTemplate)(output, x);
+	serialized = output.data;
+	assert(serialized == `{"name":"test","arr":[138,245,231,234,142,132,142]}`,
+			"serialization is not correct, produced: " ~ serialized);
+
+	// deserialization test without base64 encoding
+	deserialized = serialized.deserializeWithPolicy!(JsonStringSerializer!string, plainSerPolicyFound.PolicyTemplate, X)();
+	assert(deserialized.name == "test", "deserialization of `name` is not correct, produced: " ~ deserialized.name);
+	assert(deserialized.arr == [138, 245, 231, 234, 142, 132, 142],
+			"deserialization of `arr` is not correct, produced: " ~ to!string(deserialized.arr));
+}
+
+/**
+ * This struct contains the name of a route specified by the `path` function.
+ */
+struct PathAttribute
+{
+	/// The specified path
 	string data;
 	alias data this;
 }
@@ -482,14 +679,18 @@ package struct PathAttribute
 /// private
 package struct NoRouteAttribute {}
 
-/// Private struct describing the origin of a parameter (Query, Header, Body).
-package struct WebParamAttribute {
+/**
+ * This struct contains a mapping between the name used by HTTP (field)
+ * and the parameter (identifier) name of the function.
+ */
+public struct WebParamAttribute {
 	import vibe.web.internal.rest.common : ParameterKind;
 
+	/// The type of the WebParamAttribute
 	ParameterKind origin;
-	/// Parameter name
+	/// Parameter name (function parameter name).
 	string identifier;
-	/// The meaning of this field depends on the origin.
+	/// The meaning of this field depends on the origin. (HTTP request name)
 	string field;
 }
 
@@ -502,8 +703,8 @@ package struct WebParamAttribute {
  * If no fieldname is given, the entire body is serialized into the object.
  *
  * Params:
- * - identifier: The name of the parameter to customize. A compiler error will be issued on mismatch.
- * - field: The name of the field in the JSON object.
+ *   identifier = The name of the parameter to customize. A compiler error will be issued on mismatch.
+ *   field = The name of the field in the JSON object.
  *
  * ----
  * @bodyParam("pack", "package")
@@ -516,7 +717,7 @@ WebParamAttribute bodyParam(string identifier, string field) @safe
 in {
 	assert(field.length > 0, "fieldname can't be empty.");
 }
-body
+do
 {
 	import vibe.web.internal.rest.common : ParameterKind;
 	if (!__ctfe)
@@ -541,8 +742,8 @@ WebParamAttribute bodyParam(string identifier)
  * However, passing aggregate via header isn't a good practice and should be avoided for new production code.
  *
  * Params:
- * - identifier: The name of the parameter to customize. A compiler error will be issued on mismatch.
- * - field: The name of the header field to use (e.g: 'Accept', 'Content-Type'...).
+ *   identifier = The name of the parameter to customize. A compiler error will be issued on mismatch.
+ *   field = The name of the header field to use (e.g: 'Accept', 'Content-Type'...).
  *
  * ----
  * // The server will receive the content of the "Authorization" header.
@@ -565,8 +766,8 @@ WebParamAttribute headerParam(string identifier, string field)
  * The serialization format is not customizable.
  *
  * Params:
- * - identifier: The name of the parameter to customize. A compiler error will be issued on mismatch.
- * - field: The field name to use.
+ *   identifier = The name of the parameter to customize. A compiler error will be issued on mismatch.
+ *   field = The field name to use.
  *
  * ----
  * // For a call to postData("D is awesome"), the server will receive the query:
@@ -602,6 +803,10 @@ enum MethodStyle
 	lowerUnderscored,
 	/// UPPER_CASE_NAMING
 	upperUnderscored,
+	/// lower-case-naming
+	lowerDashed,
+	/// UPPER-CASE-NAMING
+	upperDashed,
 
 	/// deprecated
 	Unaltered = unaltered,
@@ -676,7 +881,6 @@ static assert(isNullable!(Nullable!int));
 package struct ParamError {
 	string field;
 	string text;
-	string debugText;
 }
 
 package enum ParamResult {
@@ -685,33 +889,185 @@ package enum ParamResult {
 	error
 }
 
+// maximum array index in the parameter fields.
+private enum MAX_ARR_INDEX = 0xffff;
+
+// handle the actual data inside the parameter
+private ParamResult processFormParam(T)(scope string data, string fieldname, ref T dst, ref ParamError err)
+{
+	static if (is(T == bool))
+	{
+		// getting here means the item is present, set to true.
+		dst = true;
+		return ParamResult.ok;
+	}
+	else
+	{
+		if (!data.webConvTo(dst, err)) {
+			err.field = fieldname;
+			return ParamResult.error;
+		}
+		return ParamResult.ok;
+	}
+}
+
 // NOTE: dst is assumed to be uninitialized
 package ParamResult readFormParamRec(T)(scope HTTPServerRequest req, ref T dst, string fieldname, bool required, NestedNameStyle style, ref ParamError err)
 {
 	import std.traits;
 	import std.typecons;
 	import vibe.data.serialization;
+	import std.algorithm : startsWith;
 
-	static if (isDynamicArray!T && !isSomeString!(OriginalType!T)) {
+	static if (isStaticArray!T || (isDynamicArray!T && !isSomeString!(OriginalType!T))) {
 		alias EL = typeof(T.init[0]);
-		static assert(!is(EL == bool),
-			"Boolean arrays are not allowed, because their length cannot " ~
-			"be uniquely determined. Use a static array instead.");
-		size_t idx = 0;
-		dst = T.init;
-		while (true) {
-			EL el = void;
-			auto r = readFormParamRec(req, el, style.getArrayFieldName(fieldname, idx), false, style, err);
-			if (r == ParamResult.error) return r;
-			if (r == ParamResult.skipped) break;
-			dst ~= el;
-			idx++;
+		enum isSimpleElement = !(isDynamicArray!EL && !isSomeString!(OriginalType!EL)) &&
+			!isStaticArray!EL &&
+			!(is(EL == struct) &&
+					!is(typeof(EL.fromString(string.init))) &&
+					!is(typeof(EL.fromStringValidate(string.init, null))) &&
+					!is(typeof(EL.fromISOExtString(string.init))));
+
+		static if (isStaticArray!T)
+		{
+			bool[T.length] seen;
 		}
-	} else static if (isStaticArray!T) {
-		foreach (i; 0 .. T.length) {
-			auto r = readFormParamRec(req, dst[i], style.getArrayFieldName(fieldname, i), true, style, err);
-			if (r == ParamResult.error) return r;
-			assert(r != ParamResult.skipped); break;
+		else
+		{
+			static assert(!is(EL == bool),
+			  "Boolean arrays are not allowed, because their length cannot " ~
+			  "be uniquely determined. Use a static array instead.");
+			// array to check for duplicates
+			dst = T.init;
+			bool[] seen;
+		}
+		// process the items in the order they appear.
+		char indexSep = style == NestedNameStyle.d ? '[' : '_';
+		const minLength = fieldname.length + (style == NestedNameStyle.d ? 2 : 1);
+		const indexTrailer = style == NestedNameStyle.d ? "]" : "";
+
+		ParamResult processItems(DL)(DL dlist)
+		{
+			foreach (k, v; dlist.byKeyValue)
+			{
+				if (k.length < minLength)
+					// sanity check to prevent out of bounds
+					continue;
+				if (k.startsWith(fieldname) && k[fieldname.length] == indexSep)
+				{
+					// found a potential match
+					string key = k[fieldname.length + 1 .. $];
+					size_t idx;
+					if (key == indexTrailer)
+					{
+						static if (isSimpleElement)
+						{
+							// this is a non-indexed array item. Find an empty slot, or expand the array
+							import std.algorithm : countUntil;
+							idx = seen[].countUntil(false);
+							static if (isStaticArray!T)
+							{
+								if (idx == size_t.max)
+								{
+									// ignore extras, and we know there are no more matches to come.
+									break;
+								}
+							}
+							else if (idx == size_t.max)
+							{
+								// append to the end.
+								idx = dst.length;
+							}
+						}
+						else
+						{
+							// not valid for non-simple elements.
+							continue;
+						}
+					}
+					else
+					{
+						import std.conv;
+						idx = key.parse!size_t;
+						static if (isStaticArray!T)
+						{
+							if (idx >= T.length)
+								// keep existing behavior, ignore extras
+								continue;
+						}
+						else if (idx > MAX_ARR_INDEX)
+						{
+							// Getting a bit large, we don't want to allow DOS attacks.
+							err.field = k;
+							err.text = "Maximum index exceeded";
+							return ParamResult.error;
+						}
+						static if (isSimpleElement)
+						{
+							if (key != indexTrailer)
+								// this can't be a match, simple elements are parsed from
+								// the string, there should be no more to the key.
+								continue;
+						}
+						else
+						{
+							// ensure there's more than just the index trailer
+							if (key.length == indexTrailer.length || !key.startsWith(indexTrailer))
+								// not a valid entry. ignore this entry to preserve existing behavior.
+								continue;
+						}
+					}
+
+					static if (!isStaticArray!T)
+					{
+						// check to see if we need to expand the array
+						if (dst.length <= idx)
+						{
+							dst.length = idx + 1;
+							seen.length = idx + 1;
+						}
+					}
+
+					if (seen[idx])
+					{
+						// don't store it twice
+						continue;
+					}
+					seen[idx] = true;
+
+					static if (isSimpleElement)
+					{
+						auto result = processFormParam(v, k, dst[idx], err);
+					}
+					else
+					{
+						auto subFieldname = k[0 .. $ - key.length + indexTrailer.length];
+						auto result = readFormParamRec(req, dst[idx], subFieldname, true, style, err);
+					}
+					if (result != ParamResult.ok)
+						return result;
+				}
+			}
+
+			return ParamResult.ok;
+		}
+
+		if (processItems(req.form) == ParamResult.error)
+			return ParamResult.error;
+		if (processItems(req.query) == ParamResult.error)
+			return ParamResult.error;
+
+		// make sure all static array items have been seen
+		static if (isStaticArray!T)
+		{
+			import std.algorithm : countUntil;
+			auto notSeen = seen[].countUntil(false);
+			if (notSeen != -1)
+			{
+				err.field = style.getArrayFieldName(fieldname, notSeen);
+				err.text = "Missing array form field entry.";
+				return ParamResult.error;
+			}
 		}
 	} else static if (isNullable!T) {
 		typeof(dst.get()) el = void;
@@ -753,6 +1109,77 @@ package ParamResult readFormParamRec(T)(scope HTTPServerRequest req, ref T dst, 
 	return ParamResult.ok;
 }
 
+// test new array mechanisms
+unittest {
+	import vibe.http.server;
+	import vibe.inet.url;
+
+	auto req = createTestHTTPServerRequest(URL("http://localhost/route?arr_0=1&arr_2=2&arr_=3"));
+	int[] arr;
+	ParamError err;
+	auto result = req.readFormParamRec(arr, "arr", false, NestedNameStyle.underscore, err);
+	assert(result == ParamResult.ok);
+	assert(arr == [1,3,2]);
+
+	// try with static array
+	int[3] staticarr;
+	result = req.readFormParamRec(staticarr, "arr", false, NestedNameStyle.underscore, err);
+	assert(result == ParamResult.ok);
+	assert(staticarr == [1,3,2]);
+
+	// d style
+	req = createTestHTTPServerRequest(URL("http://localhost/route?arr[2]=1&arr[0]=2&arr[]=3"));
+	result = req.readFormParamRec(arr, "arr", false, NestedNameStyle.d, err);
+	assert(result == ParamResult.ok);
+	assert(arr == [2,3,1]);
+
+	result = req.readFormParamRec(staticarr, "arr", false, NestedNameStyle.d, err);
+	assert(result == ParamResult.ok);
+	assert(staticarr == [2,3,1]);
+
+	// try nested arrays
+	req = createTestHTTPServerRequest(URL("http://localhost/route?arr[2][]=1&arr[0][]=2&arr[1][]=3&arr[0][]=4"));
+	int[][] arr2;
+	result = req.readFormParamRec(arr2, "arr", false, NestedNameStyle.d, err);
+	assert(result == ParamResult.ok);
+	assert(arr2 == [[2,4],[3],[1]]);
+
+	int[][2] staticarr2;
+	result = req.readFormParamRec(staticarr2, "arr", false, NestedNameStyle.d, err);
+	assert(result == ParamResult.ok);
+	assert(staticarr2 == [[2,4],[3]]);
+
+	// bug with key length
+	req = createTestHTTPServerRequest(URL("http://localhost/route?arr=1"));
+	result = req.readFormParamRec(arr, "arr", false, NestedNameStyle.d, err);
+	assert(result == ParamResult.ok);
+	assert(arr.length == 0);
+}
+
+unittest { // complex array parameters
+	import vibe.http.server;
+	import vibe.inet.url;
+
+	static struct S {
+		int a, b;
+	}
+
+	S[] arr;
+	ParamError err;
+
+	// d style
+	auto req = createTestHTTPServerRequest(URL("http://localhost/route?arr[0].a=1&arr[0].b=2"));
+	auto result = req.readFormParamRec(arr, "arr", false, NestedNameStyle.d, err);
+	assert(result == ParamResult.ok);
+	assert(arr == [S(1, 2)]);
+
+	// underscore style
+	req = createTestHTTPServerRequest(URL("http://localhost/route?arr_0_a=1&arr_0_b=2"));
+	result = req.readFormParamRec(arr, "arr", false, NestedNameStyle.underscore, err);
+	assert(result == ParamResult.ok);
+	assert(arr == [S(1, 2)]);
+}
+
 package bool webConvTo(T)(string str, ref T dst, ref ParamError err)
 nothrow {
 	import std.conv;
@@ -762,7 +1189,7 @@ nothrow {
 			static assert(is(typeof(T.fromStringValidate(str, &err.text)) == Nullable!T));
 			auto res = T.fromStringValidate(str, &err.text);
 			if (res.isNull()) return false;
-			dst.setVoid(res);
+			dst.setVoid(res.get);
 		} else static if (is(typeof(T.fromString(str)))) {
 			static assert(is(typeof(T.fromString(str)) == T));
 			dst.setVoid(T.fromString(str));

@@ -1,7 +1,7 @@
 /**
 	MongoCollection class
 
-	Copyright: © 2012-2016 RejectedSoftware e.K.
+	Copyright: © 2012-2016 Sönke Ludwig
 	License: Subject to the terms of the MIT license, as written in the included LICENSE.txt file.
 	Authors: Sönke Ludwig
 */
@@ -10,6 +10,8 @@ module vibe.db.mongo.collection;
 public import vibe.db.mongo.cursor;
 public import vibe.db.mongo.connection;
 public import vibe.db.mongo.flags;
+
+public import vibe.db.mongo.impl.index;
 
 import vibe.core.log;
 import vibe.db.mongo.client;
@@ -73,7 +75,7 @@ struct MongoCollection {
 	/**
 	  Performs an update operation on documents matching 'selector', updating them with 'update'.
 
-	  Throws: Exception if a DB communication error occured.
+	  Throws: Exception if a DB communication error occurred.
 	  See_Also: $(LINK http://www.mongodb.org/display/DOCS/Updating)
 	 */
 	void update(T, U)(T selector, U update, UpdateFlags flags = UpdateFlags.None)
@@ -92,7 +94,7 @@ struct MongoCollection {
 	  automatically. If you need to know the IDs of the inserted documents,
 	  you need to generate them locally.
 
-	  Throws: Exception if a DB communication error occured.
+	  Throws: Exception if a DB communication error occurred.
 	  See_Also: $(LINK http://www.mongodb.org/display/DOCS/Inserting)
 	 */
 	void insert(T)(T document_or_documents, InsertFlags flags = InsertFlags.None)
@@ -120,10 +122,10 @@ struct MongoCollection {
 	}
 
 	/// ditto
-	MongoCursor!(T, R, typeof(null)) find(R = Bson, T)(T query) { return find!R(query, null); }
+	MongoCursor!R find(R = Bson, T)(T query) { return find!R(query, null); }
 
 	/// ditto
-	MongoCursor!(Bson, R, typeof(null)) find(R = Bson)() { return find!R(Bson.emptyObject, null); }
+	MongoCursor!R find(R = Bson)() { return find!R(Bson.emptyObject, null); }
 
 	/** Queries the collection for existing documents.
 
@@ -132,7 +134,7 @@ struct MongoCollection {
 			when no document matched. For types R that are not Bson, the returned value is either
 			of type $(D R), or of type $(Nullable!R), if $(D R) is not a reference/pointer type.
 
-		Throws: Exception if a DB communication error or a query error occured.
+		Throws: Exception if a DB communication error or a query error occurred.
 		See_Also: $(LINK http://www.mongodb.org/display/DOCS/Querying)
 	 */
 	auto findOne(R = Bson, T, U)(T query, U returnFieldSelector, QueryFlags flags = QueryFlags.None)
@@ -162,7 +164,7 @@ struct MongoCollection {
 	/**
 	  Removes documents from the collection.
 
-	  Throws: Exception if a DB communication error occured.
+	  Throws: Exception if a DB communication error occurred.
 	  See_Also: $(LINK http://www.mongodb.org/display/DOCS/Removing)
 	 */
 	void remove(T)(T selector, DeleteFlags flags = DeleteFlags.None)
@@ -262,7 +264,7 @@ struct MongoCollection {
 	/**
 		Counts the results of the specified query expression.
 
-		Throws Exception if a DB communication error occured.
+		Throws Exception if a DB communication error occurred.
 		See_Also: $(LINK http://www.mongodb.org/display/DOCS/Advanced+Queries#AdvancedQueries-{{count%28%29}})
 	*/
 	ulong count(T)(T query)
@@ -300,7 +302,7 @@ struct MongoCollection {
 			value is either a single `Bson` array value or a `MongoCursor`
 			(input range) of the requested document type.
 
-		Throws: Exception if a DB communication error occured
+		Throws: Exception if a DB communication error occurred.
 
 		See_Also: $(LINK http://docs.mongodb.org/manual/reference/method/db.collection.aggregate)
 	*/
@@ -324,17 +326,16 @@ struct MongoCollection {
 	{
 		assert(m_client !is null, "Querying uninitialized MongoCollection.");
 
-		Bson cmd = Bson.emptyObject;
-		foreach (member; __traits(allMembers, AggregateOptions)) {
-			alias T = typeof(mixin("options." ~ member));
-			static if (is(T : Nullable!U, U)) {
-				if (!mixin("options." ~ member).isNull)
-					cmd[member] = mixin("options." ~ member).serializeToBson;
-			}
-		}
+		Bson cmd = Bson.emptyObject; // empty object because order is important
 		cmd["aggregate"] = Bson(m_name);
 		cmd["pipeline"] = serializeToBson(pipeline);
-		cmd["cursor"] = serializeToBson(options.cursor);
+		foreach (string k, v; serializeToBson(options))
+		{
+			// spec recommends to omit cursor field when explain is true
+			if (!options.explain.isNull && options.explain.get && k == "cursor")
+				continue;
+			cmd[k] = v;
+		}
 		auto ret = database.runCommand(cmd);
 		enforce(ret["ok"].get!double == 1, "Aggregate command failed: "~ret["errmsg"].opt!string);
 		R[] existing;
@@ -373,7 +374,7 @@ struct MongoCollection {
 			args ~= serializeToBson(["$sort": ["total": -1]]);
 
 			AggregateOptions options;
-			options.cursor.batchSize = 10; // prefetch the first 10 results
+			options.cursor.batchSize = 10; // pre-fetch the first 10 results
 			auto results = db["coll"].aggregate(args, options);
 		}
 	}
@@ -434,43 +435,31 @@ struct MongoCollection {
 		}
 	}
 
-	/**
-		Creates or updates an index.
+	/*
+		following MongoDB standard API for the Index Management specification:
 
-		Note that the overload taking an associative array of field orders
-		will be removed. Since the order of fields matters, it is
-		only suitable for single-field indices.
+		Standards: https://github.com/mongodb/specifications/blob/0c6e56141c867907aacf386e0cbe56d6562a0614/source/index-management.rst#standard-api
 	*/
+
+	deprecated("This is a legacy API, call createIndexes instead")
 	void ensureIndex(scope const(Tuple!(string, int))[] field_orders, IndexFlags flags = IndexFlags.none, Duration expire_time = 0.seconds)
 	@safe {
-		// TODO: support 2d indexes
+		IndexModel[1] models;
+		IndexOptions options;
+		if (flags & IndexFlags.unique) options.unique = true;
+		if (flags & IndexFlags.dropDuplicates) options.dropDups = true;
+		if (flags & IndexFlags.background) options.background = true;
+		if (flags & IndexFlags.sparse) options.sparse = true;
+		if (flags & IndexFlags.expireAfterSeconds) options.expireAfter = expire_time;
 
-		auto key = Bson.emptyObject;
-		auto indexname = appender!string();
-		bool first = true;
-		foreach (fo; field_orders) {
-			if (!first) indexname.put('_');
-			else first = false;
-			indexname.put(fo[0]);
-			indexname.put('_');
-			indexname.put(to!string(fo[1]));
-			key[fo[0]] = Bson(fo[1]);
+		models[0].options = options;
+		foreach (field; field_orders) {
+			models[0].add(field[0], field[1]);
 		}
-
-		Bson[string] doc;
-		doc["v"] = 1;
-		doc["key"] = key;
-		doc["ns"] = m_fullPath;
-		doc["name"] = indexname.data;
-		if (flags & IndexFlags.unique) doc["unique"] = true;
-		if (flags & IndexFlags.dropDuplicates) doc["dropDups"] = true;
-		if (flags & IndexFlags.background) doc["background"] = true;
-		if (flags & IndexFlags.sparse) doc["sparse"] = true;
-		if (flags & IndexFlags.expireAfterSeconds) doc["expireAfterSeconds"] = expire_time.total!"seconds";
-		database["system.indexes"].insert(doc);
+		createIndexes(models);
 	}
-	/// ditto
-	deprecated("Use the overload taking an array of field_orders instead.")
+
+	deprecated("This is a legacy API, call createIndexes instead. This API is not recommended to be used because of unstable dictionary ordering.")
 	void ensureIndex(int[string] field_orders, IndexFlags flags = IndexFlags.none, ulong expireAfterSeconds = 0)
 	@safe {
 		Tuple!(string, int)[] orders;
@@ -479,8 +468,17 @@ struct MongoCollection {
 		ensureIndex(orders, flags, expireAfterSeconds.seconds);
 	}
 
-	void dropIndex(string name)
+	/**
+		Drops a single index from the collection by the index name.
+
+		Throws: `Exception` if it is attempted to pass in `*`.
+		Use dropIndexes() to remove all indexes instead.
+	*/
+	void dropIndex(string name, DropIndexOptions options = DropIndexOptions.init)
 	@safe {
+		if (name == "*")
+			throw new Exception("Attempted to remove single index with '*'");
+
 		static struct CMD {
 			string dropIndexes;
 			string index;
@@ -493,6 +491,230 @@ struct MongoCollection {
 		enforce(reply["ok"].get!double == 1, "dropIndex command failed: "~reply["errmsg"].opt!string);
 	}
 
+	/// ditto
+	void dropIndex(T)(T keys,
+		IndexOptions indexOptions = IndexOptions.init,
+		DropIndexOptions options = DropIndexOptions.init)
+	@safe if (!is(Unqual!T == IndexModel))
+	{
+		IndexModel model;
+		model.keys = serializeToBson(keys);
+		model.options = indexOptions;
+		dropIndex(model.name, options);
+	}
+
+	/// ditto
+	void dropIndex(const IndexModel keys,
+		DropIndexOptions options = DropIndexOptions.init)
+	@safe {
+		dropIndex(keys.name, options);
+	}
+
+	///
+	@safe unittest
+	{
+		import vibe.db.mongo.mongo;
+
+		void test()
+		{
+			auto coll = connectMongoDB("127.0.0.1").getCollection("test");
+			auto primarykey = IndexModel()
+					.add("name", 1)
+					.add("primarykey", -1);
+			coll.dropIndex(primarykey);
+		}
+	}
+
+	/// Drops all indexes in the collection.
+	void dropIndexes(DropIndexOptions options = DropIndexOptions.init)
+	@safe {
+		static struct CMD {
+			string dropIndexes;
+			string index;
+		}
+
+		CMD cmd;
+		cmd.dropIndexes = m_name;
+		cmd.index = "*";
+		auto reply = database.runCommand(cmd);
+		enforce(reply["ok"].get!double == 1, "dropIndexes command failed: "~reply["errmsg"].opt!string);
+	}
+
+	/// Unofficial API extension, more efficient multi-index removal on
+	/// MongoDB 4.2+
+	void dropIndexes(string[] names, DropIndexOptions options = DropIndexOptions.init)
+	@safe {
+		MongoConnection conn = m_client.lockConnection();
+		if (conn.description.satisfiesVersion(WireVersion.v42)) {
+			static struct CMD {
+				string dropIndexes;
+				string[] index;
+			}
+
+			CMD cmd;
+			cmd.dropIndexes = m_name;
+			cmd.index = names;
+			auto reply = database.runCommand(cmd);
+			enforce(reply["ok"].get!double == 1, "dropIndexes command failed: "~reply["errmsg"].opt!string);
+		} else {
+			foreach (name; names)
+				dropIndex(name);
+		}
+	}
+
+	///
+	@safe unittest
+	{
+		import vibe.db.mongo.mongo;
+
+		void test()
+		{
+			auto coll = connectMongoDB("127.0.0.1").getCollection("test");
+			coll.dropIndexes(["name_1_primarykey_-1"]);
+		}
+	}
+
+	/**
+		Convenience method for creating a single index. Calls `createIndexes`
+
+		Supports any kind of document for template parameter T or a IndexModel.
+
+		Params:
+			keys = a IndexModel or type with integer or string fields indicating
+				index direction or index type.
+	*/
+	string createIndex(T)(T keys,
+		IndexOptions indexOptions = IndexOptions.init,
+		CreateIndexOptions options = CreateIndexOptions.init)
+	@safe if (!is(Unqual!T == IndexModel))
+	{
+		IndexModel[1] model;
+		model[0].keys = serializeToBson(keys);
+		model[0].options = indexOptions;
+		return createIndexes(model[], options)[0];
+	}
+
+	/// ditto
+	string createIndex(const IndexModel keys,
+		CreateIndexOptions options = CreateIndexOptions.init)
+	@safe {
+		IndexModel[1] model;
+		model[0] = keys;
+		return createIndexes(model[], options)[0];
+	}
+
+	///
+	@safe unittest
+	{
+		import vibe.db.mongo.mongo;
+
+		void test()
+		{
+			auto coll = connectMongoDB("127.0.0.1").getCollection("test");
+
+			// simple ascending name, descending primarykey compound-index
+			coll.createIndex(["name": 1, "primarykey": -1]);
+
+			IndexOptions textOptions = {
+				// pick language from another field called "idioma"
+				languageOverride: "idioma"
+			};
+			auto textIndex = IndexModel()
+					.withOptions(textOptions)
+					.add("comments", IndexType.text);
+			// more complex text index in DB with independent language
+			coll.createIndex(textIndex);
+		}
+	}
+
+	/**
+		Builds one or more indexes in the collection.
+
+		See_Also: $(LINK https://docs.mongodb.com/manual/reference/command/createIndexes/)
+	*/
+	string[] createIndexes(scope const(IndexModel)[] models,
+		CreateIndexesOptions options = CreateIndexesOptions.init)
+	@safe {
+		string[] keys = new string[models.length];
+
+		MongoConnection conn = m_client.lockConnection();
+		if (conn.description.satisfiesVersion(WireVersion.v26)) {
+			Bson cmd = Bson.emptyObject;
+			cmd["createIndexes"] = m_name;
+			Bson[] indexes;
+			foreach (model; models) {
+				// trusted to support old compilers which think opt_dup has
+				// longer lifetime than model.options
+				IndexOptions opt_dup = (() @trusted => model.options)();
+				enforceWireVersionConstraints(opt_dup, conn.description.maxWireVersion);
+				Bson index = serializeToBson(opt_dup);
+				index["key"] = model.keys;
+				index["name"] = model.name;
+				indexes ~= index;
+			}
+			cmd["indexes"] = Bson(indexes);
+			auto reply = database.runCommand(cmd);
+			enforce(reply["ok"].get!double == 1, "createIndex command failed: "
+				~ reply["errmsg"].opt!string);
+		} else {
+			foreach (model; models) {
+				// trusted to support old compilers which think opt_dup has
+				// longer lifetime than model.options
+				IndexOptions opt_dup = (() @trusted => model.options)();
+				enforceWireVersionConstraints(opt_dup, WireVersion.old);
+				Bson doc = serializeToBson(opt_dup);
+				doc["v"] = 1;
+				doc["key"] = model.keys;
+				doc["ns"] = m_fullPath;
+				doc["name"] = model.name;
+				database["system.indexes"].insert(doc);
+			}
+		}
+
+		return keys;
+	}
+
+	/**
+		Returns an array that holds a list of documents that identify and describe the existing indexes on the collection. 
+	*/
+	MongoCursor!R listIndexes(R = Bson)() 
+	@safe {
+		MongoConnection conn = m_client.lockConnection();
+		if (conn.description.satisfiesVersion(WireVersion.v30)) {
+			static struct CMD {
+				string listIndexes;
+			}
+
+			CMD cmd;
+			cmd.listIndexes = m_name;
+
+			auto reply = database.runCommand(cmd);
+			enforce(reply["ok"].get!double == 1, "getIndexes command failed: "~reply["errmsg"].opt!string);
+			return MongoCursor!R(m_client, reply["cursor"]["ns"].get!string, reply["cursor"]["id"].get!long, reply["cursor"]["firstBatch"].get!(Bson[]));
+		} else {
+			return database["system.indexes"].find!R();
+		}
+	}
+
+	///
+	@safe unittest
+	{
+		import vibe.db.mongo.mongo;
+
+		void test()
+		{
+			auto coll = connectMongoDB("127.0.0.1").getCollection("test");
+
+			foreach (index; coll.listIndexes())
+				logInfo("index %s: %s", index["name"].get!string, index);
+		}
+	}
+
+	deprecated("Please use the standard API name 'listIndexes'") alias getIndexes = listIndexes;
+
+	/**
+		Removes a collection or view from the database. The method also removes any indexes associated with the dropped collection.
+	*/
 	void drop()
 	@safe {
 		static struct CMD {
@@ -576,7 +798,7 @@ unittest {
 		// the same goes for findOne
 		Nullable!User qusr = users.findOne!User(["_id": usr.id]);
 		if (!qusr.isNull)
-			logInfo("User: %s", qusr.loginName);
+			logInfo("User: %s", qusr.get.loginName);
 	}
 }
 
@@ -598,12 +820,12 @@ struct ReadConcern {
 		linearizable = "linearizable"
 	}
 
-	///
-	Level level;
+	/// The level of the read concern.
+	string level;
 }
 
 /**
-  Collation allows users to specify language-specific rules for string comparison, such as rules for lettercase and accent marks.
+  Collation allows users to specify language-specific rules for string comparison, such as rules for letter-case and accent marks.
 
   See_Also: $(LINK https://docs.mongodb.com/manual/reference/collation/)
  */
@@ -633,59 +855,183 @@ struct Collation {
 	 */
 	string locale;
 	/// The level of comparison to perform. Corresponds to ICU Comparison Levels.
-	int strength;
+	@embedNullable Nullable!int strength;
 	/// Flag that determines whether to include case comparison at strength level 1 or 2.
-	bool caseLevel;
+	@embedNullable Nullable!bool caseLevel;
 	/// A flag that determines sort order of case differences during tertiary level comparisons.
-	string caseFirst;
+	@embedNullable Nullable!string caseFirst;
 	/// Flag that determines whether to compare numeric strings as numbers or as strings.
-	bool numericOrdering;
+	@embedNullable Nullable!bool numericOrdering;
 	/// Field that determines whether collation should consider whitespace and punctuation as base characters for purposes of comparison.
-	Alternate alternate;
+	@embedNullable Nullable!Alternate alternate;
 	/// Field that determines up to which characters are considered ignorable when `alternate: "shifted"`. Has no effect if `alternate: "non-ignorable"`
-	MaxVariable maxVariable;
+	@embedNullable Nullable!MaxVariable maxVariable;
 	/**
 	  Flag that determines whether strings with diacritics sort from back of the string, such as with some French dictionary ordering.
 
 	  If `true` compare from back to front, otherwise front to back.
 	 */
-	bool backwards;
+	@embedNullable Nullable!bool backwards;
 	/// Flag that determines whether to check if text require normalization and to perform normalization. Generally, majority of text does not require this normalization processing.
-	bool normalization;
+	@embedNullable Nullable!bool normalization;
 }
 
 ///
 struct CursorInitArguments {
-	/// Specifies the initial batch size for the cursor.
-	int batchSize;
+	/// Specifies the initial batch size for the cursor. Or null for server
+	/// default value.
+	@embedNullable Nullable!int batchSize;
+}
+
+/// UDA to unset a nullable field if the server wire version doesn't at least
+/// match the given version. (inclusive)
+///
+/// Use with $(LREF enforceWireVersionConstraints)
+struct MinWireVersion
+{
+	///
+	WireVersion v;
+}
+
+/// ditto
+MinWireVersion since(WireVersion v) @safe { return MinWireVersion(v); }
+
+/// UDA to unset a nullable field if the server wire version is newer than the
+/// given version. (inclusive)
+///
+/// Use with $(LREF enforceWireVersionConstraints)
+struct MaxWireVersion
+{
+	///
+	WireVersion v;
+}
+/// ditto
+MaxWireVersion until(WireVersion v) @safe { return MaxWireVersion(v); }
+
+/// Unsets nullable fields not matching the server version as defined per UDAs.
+void enforceWireVersionConstraints(T)(ref T field, WireVersion serverVersion)
+@safe {
+	import std.traits : getUDAs;
+
+	foreach (i, ref v; field.tupleof) {
+		enum minV = getUDAs!(field.tupleof[i], MinWireVersion);
+		enum maxV = getUDAs!(field.tupleof[i], MaxWireVersion);
+
+		static foreach (min; minV)
+			if (serverVersion < min.v)
+				v.nullify();
+
+		static foreach (max; maxV)
+			if (serverVersion > max.v)
+				v.nullify();
+	}
+}
+
+///
+unittest
+{
+	struct SomeMongoCommand
+	{
+		@embedNullable @since(WireVersion.v34)
+		Nullable!int a;
+
+		@embedNullable @until(WireVersion.v30)
+		Nullable!int b;
+	}
+
+	SomeMongoCommand cmd;
+	cmd.a = 1;
+	cmd.b = 2;
+	assert(!cmd.a.isNull);
+	assert(!cmd.b.isNull);
+
+	SomeMongoCommand test = cmd;
+	enforceWireVersionConstraints(test, WireVersion.v30);
+	assert(test.a.isNull);
+	assert(!test.b.isNull);
+
+	test = cmd;
+	enforceWireVersionConstraints(test, WireVersion.v32);
+	assert(test.a.isNull);
+	assert(test.b.isNull);
+
+	test = cmd;
+	enforceWireVersionConstraints(test, WireVersion.v34);
+	assert(!test.a.isNull);
+	assert(test.b.isNull);
 }
 
 /**
   Represents available options for an aggregate call
 
   See_Also: $(LINK https://docs.mongodb.com/manual/reference/method/db.collection.aggregate/)
+
+  Standards: $(LINK https://github.com/mongodb/specifications/blob/0c6e56141c867907aacf386e0cbe56d6562a0614/source/crud/crud.rst#api)
  */
 struct AggregateOptions {
-	/// Specifies the initial batch size for the cursor.
+	// non-optional since 3.6
+	// get/set by `batchSize`, undocumented in favor of that field
 	CursorInitArguments cursor;
-	/// Specifies to return the information on the processing of the pipeline.
-	Nullable!bool explain;
-	/// Enables writing to temporary files. When set to true, aggregation operations can write data to the _tmp subdirectory in the dbPath directory.
-	Nullable!bool allowDiskUse;
-	/// Specifies a time limit in milliseconds for processing operations on a cursor. If you do not specify a value for maxTimeMS, operations will not time out.
-	Nullable!uint maxTimeMS;
-	/// Available only if you specify the $out aggregation operator.
-	Nullable!bool bypassDocumentValidation;
-	/// Specifies the read concern.
-	Nullable!ReadConcern readConcern;
-	///
-	Nullable!Collation collation;
-	/**
-	  The index to use for the aggregation. The index is on the initial collection/view against which the aggregation is run.
 
-	  Specify the index either by the index name or by the index specification document.
+	/// Specifies the initial batch size for the cursor.
+	ref inout(Nullable!int) batchSize()
+	@property inout @safe pure nothrow @nogc @ignore {
+		return cursor.batchSize;
+	}
+
+	// undocumented because this field isn't a spec field because it is
+	// out-of-scope for a driver
+	@embedNullable Nullable!bool explain;
+
+	/**
+		Enables writing to temporary files. When set to true, aggregation
+		operations can write data to the _tmp subdirectory in the dbPath
+		directory.
+	*/
+	@embedNullable Nullable!bool allowDiskUse;
+
+	/**
+		Specifies a time limit in milliseconds for processing operations on a
+		cursor. If you do not specify a value for maxTimeMS, operations will not
+		time out.
+	*/
+	@embedNullable Nullable!long maxTimeMS;
+
+	/**
+		If true, allows the write to opt-out of document level validation.
+		This only applies when the $out or $merge stage is specified.
+	*/
+	@embedNullable Nullable!bool bypassDocumentValidation;
+
+	/**
+		Specifies the read concern. Only compatible with a write stage. (e.g.
+		`$out`, `$merge`)
+
+		Aggregate commands do not support the $(D ReadConcern.Level.linearizable)
+		level.
+
+		Standards: $(LINK https://github.com/mongodb/specifications/blob/7745234f93039a83ae42589a6c0cdbefcffa32fa/source/read-write-concern/read-write-concern.rst)
+	*/
+	@embedNullable Nullable!ReadConcern readConcern;
+
+	/// Specifies a collation.
+	@embedNullable Nullable!Collation collation;
+
+	/**
+		The index to use for the aggregation. The index is on the initial
+		collection / view against which the aggregation is run.
+
+		The hint does not apply to $lookup and $graphLookup stages.
+
+		Specify the index either by the index name as a string or the index key
+		pattern. If specified, then the query system will only consider plans
+		using the hinted index.
 	 */
-	Nullable!Bson hint;
-	/// Users can specify an arbitrary string to help trace the operation through the database profiler, currentOp, and logs.
-	Nullable!string comment;
+	@embedNullable Nullable!Bson hint;
+
+	/**
+		Users can specify an arbitrary string to help trace the operation
+		through the database profiler, currentOp, and logs.
+	*/
+	@embedNullable Nullable!string comment;
 }

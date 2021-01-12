@@ -1,7 +1,7 @@
 /**
 	Stream proxy and wrapper facilities.
 
-	Copyright: © 2013-2016 RejectedSoftware e.K.
+	Copyright: © 2013-2016 Sönke Ludwig
 	License: Subject to the terms of the MIT license, as written in the included LICENSE.txt file.
 	Authors: Sönke Ludwig
 */
@@ -242,19 +242,23 @@ class ConnectionProxyStream : ConnectionStream {
 	after a call to front. This property allows the range to be used in
 	request-response scenarios.
 */
-struct StreamInputRange {
+deprecated("Use streamInputRange() instead.")
+StreamInputRange!OutputStream StreamInputRange()(InputStream stream) { return StreamInputRange!InputStream(stream); }
+/// ditto
+struct StreamInputRange(InputStream, size_t buffer_size = 256)
+	if (isInputStream!InputStream)
+{
 @safe:
-
 	private {
 		struct Buffer {
-			ubyte[256] data = void;
+			ubyte[buffer_size] data = void;
 			size_t fill = 0;
 		}
 		InputStream m_stream;
 		Buffer* m_buffer;
 	}
 
-	this (InputStream stream)
+	private this(InputStream stream)
 	{
 		m_stream = stream;
 		m_buffer = new Buffer;
@@ -282,11 +286,18 @@ struct StreamInputRange {
 		m_buffer.fill = sz;
 	}
 }
+/// ditto
+auto streamInputRange(size_t buffer_size = 256, InputStream)(InputStream stream)
+	if (isInputStream!InputStream)
+{
+	return StreamInputRange!(InputStream, buffer_size)(stream);
+}
 
 
 /**
 	Implements a buffered output range interface on top of an OutputStream.
 */
+deprecated("Use streamOutputRange() instead.")
 StreamOutputRange!OutputStream StreamOutputRange()(OutputStream stream) { return StreamOutputRange!OutputStream(stream); }
 /// ditto
 struct StreamOutputRange(OutputStream, size_t buffer_size = 256)
@@ -298,10 +309,12 @@ struct StreamOutputRange(OutputStream, size_t buffer_size = 256)
 		OutputStream m_stream;
 		size_t m_fill = 0;
 		ubyte[buffer_size] m_data = void;
+		bool m_flushInDestructor = true;
 	}
 
 	@disable this(this);
 
+	/// private
 	this(OutputStream stream)
 	{
 		m_stream = stream;
@@ -309,13 +322,16 @@ struct StreamOutputRange(OutputStream, size_t buffer_size = 256)
 
 	~this()
 	{
-		flush();
+		if (m_flushInDestructor) {
+			scope (failure) () @trusted { destroy(m_stream); }(); // workaround for #2484
+			flush();
+		}
 	}
 
 	void flush()
 	{
 		if (m_fill == 0) return;
-		m_stream.write(m_data[0 .. m_fill]);
+		writeToStream(m_data[0 .. m_fill]);
 		m_fill = 0;
 	}
 
@@ -335,7 +351,7 @@ struct StreamOutputRange(OutputStream, size_t buffer_size = 256)
 		// avoid writing more chunks than necessary
 		if (bts.length + m_fill >= m_data.length * 2) {
 			flush();
-			m_stream.write(bts);
+			writeToStream(bts);
 			return;
 		}
 
@@ -360,6 +376,15 @@ struct StreamOutputRange(OutputStream, size_t buffer_size = 256)
 	}
 
 	void put(const(dchar)[] elems) { foreach( ch; elems ) put(ch); }
+
+	private void writeToStream(in ubyte[] bytes)
+	{
+		// if the write fails, do not attempt another write in the destructor
+		// to avoid throwing an exception twice or nested
+		m_flushInDestructor = false;
+		m_stream.write(bytes);
+		m_flushInDestructor = true;
+	}
 }
 /// ditto
 auto streamOutputRange(size_t buffer_size = 256, OutputStream)(OutputStream stream)
@@ -385,4 +410,32 @@ unittest {
 	auto test = "häl";
 	assert(test.length == 4);
 	assert(writeLength(test[0], test[1], test[2], test[3]) == test.length);
+}
+
+unittest {
+	static struct ThrowOutputStream {
+		@safe:
+		size_t write(in ubyte[] bytes, IOMode mode) @blocking { throw new Exception("Write failed."); }
+		void write(in ubyte[] bytes) @blocking { auto n = write(bytes, IOMode.all); assert(n == bytes.length); }
+		void write(in char[] bytes) @blocking { write(cast(const(ubyte)[])bytes); }
+		void flush() @blocking {}
+		void finalize() @blocking {}
+	}
+	mixin validateOutputStream!ThrowOutputStream;
+
+	ThrowOutputStream str;
+
+	assertThrown!Exception(() {
+		auto r = streamOutputRange(str);
+		// too few bytes to auto-flush
+		assertNotThrown!Exception(r.put("test"));
+	} ());
+
+	try {
+		auto r = streamOutputRange(str);
+		// too few bytes to auto-flush
+		assertNotThrown!Exception(r.put("test"));
+		assertThrown!Exception(r.flush());
+		assertThrown!Exception(r.flush());
+	} catch (Exception e) assert(false, "Descructor has thrown redundant exception");
 }

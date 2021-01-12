@@ -1,7 +1,7 @@
 /**
 	A HTTP 1.1/1.0 server implementation.
 
-	Copyright: © 2012-2013 RejectedSoftware e.K.
+	Copyright: © 2012-2013 Sönke Ludwig
 	License: Subject to the terms of the MIT license, as written in the included LICENSE.txt file.
 	Authors: Sönke Ludwig, Jan Krüger
 */
@@ -29,7 +29,7 @@ class HTTPLogger {
 		Appender!(char[]) m_lineAppender;
 	}
 
-	this(in HTTPServerSettings settings, string format)
+	this(const HTTPServerSettings settings, string format)
 	{
 		m_format = format;
 		m_settings = settings;

@@ -3,14 +3,15 @@
 
 	This is a minimal implementation based on RFC 2069.
 
-	Copyright: © 2015 RejectedSoftware e.K.
+	Copyright: © 2015 Sönke Ludwig
 	License: Subject to the terms of the MIT license, as written in the included LICENSE.txt file.
 	Authors: Kai Nacke
 */
 module vibe.http.auth.digest_auth;
 
-import vibe.http.server;
 import vibe.core.log;
+import vibe.crypto.cryptorand;
+import vibe.http.server;
 import vibe.inet.url;
 
 import std.base64;
@@ -18,7 +19,6 @@ import std.datetime;
 import std.digest.md;
 import std.exception;
 import std.string;
-import std.uuid;
 
 @safe:
 
@@ -29,12 +29,12 @@ class DigestAuthInfo
 	@safe:
 
 	string realm;
-	ubyte[] secret;
+	ubyte[32] secret;
 	ulong timeout;
 
 	this()
 	{
-		secret = randomUUID().data.dup;
+		secureRNG.read(secret[]);
 		timeout = 300;
 	}
 
@@ -238,6 +238,7 @@ struct DigestAuthParams {
 	Creates the digest authorization request header.
 
 	Params:
+		method = HTTP method (required only when some qop is requested)
 		username = user name
 		password = user password
 		url = requested url

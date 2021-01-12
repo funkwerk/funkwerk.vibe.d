@@ -1,7 +1,7 @@
 /**
 	Utility functions for array processing
 
-	Copyright: © 2012 RejectedSoftware e.K.
+	Copyright: © 2012 Sönke Ludwig
 	License: Subject to the terms of the MIT license, as written in the included LICENSE.txt file.
 	Authors: Sönke Ludwig
 */
@@ -15,6 +15,7 @@ import std.traits;
 static import std.utf;
 
 
+deprecated("This function was accidentally exposed and should not be used")
 void removeFromArray(T)(ref T[] array, T item)
 {
 	foreach( i; 0 .. array.length )
@@ -24,6 +25,7 @@ void removeFromArray(T)(ref T[] array, T item)
 		}
 }
 
+deprecated("This function was accidentally exposed and should not be used")
 void removeFromArrayIdx(T)(ref T[] array, size_t idx)
 {
 	foreach( j; idx+1 .. array.length)
@@ -83,10 +85,6 @@ struct AllocAppender(ArrayType : E[], E) {
 			m_allocatedBuffer = true;
 		}
 		if (m_remaining.length < amount) {
-			debug {
-				import std.digest.crc;
-				auto checksum = crc32Of(m_data[0 .. nelems]);
-			}
 			if (m_allocatedBuffer) {
 				void[] vdata = m_data;
 				m_alloc.reallocate(vdata, (nelems+amount)*E.sizeof);
@@ -97,7 +95,6 @@ struct AllocAppender(ArrayType : E[], E) {
 				m_data = newdata;
 				m_allocatedBuffer = true;
 			}
-			debug assert(crc32Of(m_data[0 .. nelems]) == checksum);
 		}
 		m_remaining = m_data[nelems .. m_data.length];
 	}
@@ -280,7 +277,7 @@ struct FixedAppender(ArrayType : E[], size_t NELEM, E) {
 
 	void put(ArrayType arr)
 	{
-		m_data[m_fill .. m_fill+arr.length] = (cast(ElemType[])arr)[];
+		m_data[m_fill .. m_fill+arr.length] = arr[];
 		m_fill += arr.length;
 	}
 
@@ -648,7 +645,7 @@ struct ArraySet(Key)
 
 	void setAllocator(IAllocator allocator)
 	in { assert(m_entries.ptr is null, "Cannot set allocator after elements have been inserted."); }
-	body {
+	do {
 		m_allocator = AllocatorType(AW(allocator));
 	}
 

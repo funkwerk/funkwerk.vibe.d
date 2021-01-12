@@ -1,7 +1,7 @@
 /**
 	Utility functions for string processing
 
-	Copyright: © 2012-2014 RejectedSoftware e.K.
+	Copyright: © 2012-2014 Sönke Ludwig
 	License: Subject to the terms of the MIT license, as written in the included LICENSE.txt file.
 	Authors: Sönke Ludwig
 */
@@ -66,33 +66,6 @@ bool allOf(const(char)[] str, const(char)[] chars)
 		if (!chars.canFind(ch))
 			return false;
 	return true;
-}
-
-ptrdiff_t indexOfCT(Char)(in Char[] s, dchar c, CaseSensitive cs = CaseSensitive.yes)
-@safe pure {
-	if (__ctfe) {
-		if (cs == CaseSensitive.yes) {
-			foreach (i, dchar ch; s)
-				if (ch == c)
-					return i;
-		} else {
-			c = std.uni.toLower(c);
-			foreach (i, dchar ch; s)
-				if (std.uni.toLower(ch) == c)
-					return i;
-		}
-		return -1;
-	} else return std.string.indexOf(s, c, cs);
-}
-ptrdiff_t indexOfCT(Char)(in Char[] s, in Char[] needle)
-{
-	if (__ctfe) {
-		if (s.length < needle.length) return -1;
-		foreach (i; 0 .. s.length - needle.length)
-			if (s[i .. i+needle.length] == needle)
-				return i;
-		return -1;
-	} else return std.string.indexOf(s, needle);
 }
 
 /**
